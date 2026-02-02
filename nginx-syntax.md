@@ -788,6 +788,355 @@ server {
 set $variable value;
 ```
 
+### Nginx 变量类型详解
+
+#### 核心概念：Nginx 变量只有字符串类型
+
+**重要：Nginx 中所有变量都是字符串类型，没有整数、布尔、数组等类型。**
+
+```nginx
+# 所有这些都是字符串
+set $string "hello";
+set $number "42";           # 这是字符串 "42"，不是数字
+set $boolean "true";        # 这是字符串 "true"，不是布尔值
+set $empty "";              # 空字符串
+```
+
+#### 变量的"假值"判断
+
+在 Nginx 的 `if` 语句中，以下值被视为"假"：
+
+```nginx
+# 假值 (false)
+set $var "";              # 空字符串
+set $var "0";             # 字符串 "0"
+# 未定义的变量
+
+# 真值 (true) - 其他所有非空字符串
+set $var "1";
+set $var "true";
+set $var "false";         # 注意：字符串 "false" 是真值！
+set $var "hello";
+set $var " ";             # 空格也是真值
+```
+
+**示例：**
+
+```nginx
+location / {
+    set $flag "";
+    
+    # 空字符串被视为假
+    if ($flag) {
+        # 不会执行，因为 $flag 是空字符串
+        return 200 "flag is set";
+    }
+    
+    set $flag "0";
+    if ($flag) {
+        # 不会执行，因为 "0" 被视为假
+        return 200 "flag is 0";
+    }
+    
+    set $flag "1";
+    if ($flag) {
+        # 会执行，因为 "1" 是真值
+        return 200 "flag is 1";
+    }
+}
+```
+
+#### 变量类型转换
+
+```nginx
+# ============ 数字运算 ============
+# Nginx 本身不支持算术运算，需要借助其他模块
+
+# 方法1: 使用 ngx_http_lua_module
+set_by_lua_block $sum {
+    return tonumber(ngx.var.a) + tonumber(ngx.var.b)
+}
+
+# 方法2: 使用 ngx_http_set_misc_module
+set $a 10;
+set $b 20;
+set_eval $sum "$a + $b";
+
+# 方法3: 使用 map 模拟
+map $arg_count $next_count {
+    default "1";
+    "1"     "2";
+    "2"     "3";
+    "3"     "4";
+    # ... 有限的映射
+}
+
+# ============ 字符串操作 ============
+# 字符串拼接 - 直接拼接
+set $full_url "$scheme://$host$request_uri";
+set $greeting "Hello, $arg_name!";
+
+# 字符串包含变量时的大括号语法
+set $file "${arg_name}_file.txt";     # 避免歧义
+set $path "/data/${env}_config.json";
+```
+
+#### 变量作用域
+
+```nginx
+# ============ 变量作用域规则 ============
+
+# 1. 变量在整个请求生命周期内有效
+# 2. 变量在不同 location 之间共享（同一请求）
+# 3. 变量不在不同请求之间共享
+
+server {
+    # server 级别设置变量
+    set $server_var "server_value";
+    
+    location /first {
+        set $loc_var "first_value";
+        # 可以访问 $server_var
+        return 200 "server: $server_var, loc: $loc_var";
+    }
+    
+    location /second {
+        # 可以访问 $server_var
+        # 如果是内部跳转，可以访问 $loc_var
+        return 200 "server: $server_var";
+    }
+    
+    location /redirect {
+        set $my_var "original";
+        # 内部重定向后，变量保持
+        rewrite ^ /target last;
+    }
+    
+    location /target {
+        # 如果是从 /redirect 重定向来的，$my_var 仍然可用
+        return 200 "my_var: $my_var";
+    }
+}
+```
+
+#### 变量初始化时机
+
+```nginx
+# ============ 变量在请求处理时才求值 ============
+
+map $uri $backend {
+    default "backend_a";
+    /api    "backend_b";
+}
+
+server {
+    # $backend 在这里并没有被计算
+    # 而是在实际使用时才求值
+    
+    location / {
+        # 此时 $backend 才被求值
+        proxy_pass http://$backend;
+    }
+}
+```
+
+#### 特殊变量行为
+
+```nginx
+# ============ 内置变量是只读的 ============
+
+location / {
+    # ❌ 错误：不能修改内置变量
+    # set $uri "/new/path";
+    # set $host "new.example.com";
+    
+    # ✅ 正确：使用自定义变量
+    set $my_uri $uri;
+    set $my_host $host;
+    
+    # 然后修改自定义变量
+    if ($my_uri ~ ^/old/) {
+        set $my_uri "/new/";
+    }
+}
+
+# ============ 某些变量可写 ============
+
+location / {
+    # $args 可以被修改
+    set $args "modified=true&$args";
+    
+    # $limit_rate 可以被修改
+    set $limit_rate 100k;
+}
+```
+
+#### 变量类型速查表
+
+| 类型 | Nginx 表示 | 示例 | 说明 |
+|------|-----------|------|------|
+| 字符串 | `"text"` 或 `text` | `set $var "hello";` | 唯一的实际类型 |
+| 数字 | `"123"` | `set $var "42";` | 实际是字符串 |
+| 布尔-真 | 非空非零字符串 | `set $var "1";` | "1", "true", "yes" 等 |
+| 布尔-假 | 空或 "0" | `set $var "";` | "", "0" |
+| 空/未定义 | 空字符串 | `set $var "";` | 等同于假值 |
+| 列表/数组 | 不支持 | - | 使用 map 或多个变量 |
+
+#### 模拟布尔逻辑
+
+```nginx
+# ============ 模拟布尔值 ============
+
+location / {
+    # 初始化为 "假"
+    set $is_allowed "";
+    set $is_admin "";
+    
+    # 设置为 "真"
+    if ($remote_addr ~ ^192\.168\.) {
+        set $is_allowed "1";
+    }
+    
+    if ($http_x_admin_token = "secret") {
+        set $is_admin "1";
+    }
+    
+    # AND 逻辑
+    set $check "$is_allowed$is_admin";
+    if ($check = "11") {
+        # 两个条件都为真
+        return 200 "Access granted";
+    }
+    
+    # OR 逻辑
+    if ($is_allowed) {
+        return 200 "Allowed by IP";
+    }
+    if ($is_admin) {
+        return 200 "Allowed by token";
+    }
+    
+    return 403 "Forbidden";
+}
+```
+
+#### 模拟数组/列表
+
+```nginx
+# ============ 使用 map 模拟数组 ============
+
+# 方法1: 使用 map 做查找
+map $arg_color $color_hex {
+    default "#000000";
+    "red"    "#FF0000";
+    "green"  "#00FF00";
+    "blue"   "#0000FF";
+    "white"  "#FFFFFF";
+}
+
+# 方法2: 使用分隔符字符串
+set $allowed_methods "GET,POST,PUT,DELETE";
+
+# 检查是否在列表中（使用正则）
+if ($allowed_methods !~ $request_method) {
+    return 405;
+}
+
+# 方法3: 使用多个变量
+set $item_0 "first";
+set $item_1 "second";
+set $item_2 "third";
+```
+
+#### 变量调试技巧
+
+```nginx
+# ============ 调试变量值 ============
+
+# 方法1: 返回变量值
+location /debug {
+    default_type text/plain;
+    return 200 "
+uri: $uri
+args: $args
+host: $host
+my_var: $my_var
+";
+}
+
+# 方法2: 添加响应头
+location / {
+    add_header X-Debug-Var $my_var;
+    add_header X-Debug-URI $uri;
+    proxy_pass http://backend;
+}
+
+# 方法3: 写入日志
+log_format debug_log '$remote_addr - $request - my_var=$my_var';
+access_log /var/log/nginx/debug.log debug_log;
+
+# 方法4: 使用 echo 模块（需要安装）
+location /echo {
+    echo "Variable value: $my_var";
+    echo "Request URI: $uri";
+}
+```
+
+#### 常见陷阱
+
+```nginx
+# ============ 陷阱1: 字符串 "0" vs 空字符串 ============
+
+set $count "0";
+if ($count) {
+    # ❌ 不会执行！"0" 被视为假
+}
+
+set $count "00";
+if ($count) {
+    # ✅ 会执行！"00" 不是 "0"，被视为真
+}
+
+# ============ 陷阱2: 变量未定义 ============
+
+# 未定义的变量被视为空字符串
+if ($undefined_var) {
+    # 不会执行
+}
+
+# 使用未定义变量不会报错
+return 200 "Value: $nonexistent";  # 输出: "Value: "
+
+# ============ 陷阱3: 引号处理 ============
+
+# 引号内的变量会被解析
+set $greeting "Hello, $name!";  # 变量会被替换
+
+# 单引号不是特殊语法（Nginx 使用双引号）
+set $text 'single quotes';  # ❌ 语法错误
+
+# ============ 陷阱4: 变量名大小写 ============
+
+# 变量名区分大小写
+set $MyVar "value1";
+set $myvar "value2";
+# $MyVar 和 $myvar 是不同的变量
+
+# 但 HTTP 头变量转换为小写
+# X-Custom-Header 变成 $http_x_custom_header
+
+# ============ 陷阱5: 正则捕获组覆盖 ============
+
+location ~ ^/user/(\d+) {
+    set $user_id $1;  # 保存捕获组
+    
+    if ($uri ~ ^/user/(\d+)/profile) {
+        # ⚠️ 这里的 $1 会覆盖之前的 $1
+        # 使用之前保存的 $user_id
+    }
+}
+```
+
 ### 使用场景
 
 #### 1. 定义常量
