@@ -270,6 +270,8 @@ registry=https://registry.npmjs.org/
 
 ### 1. 项目初始化
 
+#### 使用传统工具
+
 ```bash
 # 创建项目目录
 mkdir my-python-package && cd my-python-package
@@ -281,6 +283,50 @@ source venv/bin/activate  # Linux/Mac
 
 # 安装构建工具
 pip install build twine hatch
+```
+
+#### 使用 uv（推荐）
+
+[uv](https://github.com/astral-sh/uv) 是由 Astral 开发的超快 Python 包管理器，用 Rust 编写。
+
+```bash
+# 安装 uv
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 或使用 pip
+pip install uv
+
+# 或使用 Homebrew
+brew install uv
+```
+
+```bash
+# 使用 uv 初始化项目
+uv init my-python-package
+cd my-python-package
+
+# 创建虚拟环境
+uv venv
+
+# 激活虚拟环境
+source .venv/bin/activate  # Linux/Mac
+# .venv\Scripts\activate   # Windows
+
+# 安装依赖
+uv add requests pydantic
+
+# 安装开发依赖
+uv add --dev pytest mypy ruff
+
+# 从 requirements.txt 安装
+uv pip install -r requirements.txt
+
+# 同步依赖（根据 pyproject.toml）
+uv sync
 ```
 
 ### 2. 项目结构
@@ -562,6 +608,8 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 
 ### 5. 构建与发布
 
+#### 使用传统工具 (build + twine)
+
 ```bash
 # 构建包
 python -m build
@@ -579,6 +627,184 @@ twine upload dist/*
 twine upload -u __token__ -p $PYPI_TOKEN dist/*
 ```
 
+#### 使用 uv 发布（推荐）
+
+```bash
+# ============ 构建 ============
+
+# 使用 uv 构建包
+uv build
+
+# 构建输出到 dist/ 目录
+# dist/
+# ├── my_package-1.0.0-py3-none-any.whl
+# └── my_package-1.0.0.tar.gz
+
+# 仅构建 wheel
+uv build --wheel
+
+# 仅构建 sdist
+uv build --sdist
+
+# ============ 发布 ============
+
+# 发布到 PyPI
+uv publish
+
+# 发布到 TestPyPI
+uv publish --publish-url https://test.pypi.org/legacy/
+
+# 使用 token 发布
+uv publish --token $PYPI_TOKEN
+
+# 发布到私有仓库
+uv publish --publish-url https://pypi.mycompany.com/legacy/
+
+# 指定用户名密码
+uv publish --username myuser --password mypassword
+
+# 发布特定文件
+uv publish dist/my_package-1.0.0-py3-none-any.whl
+
+# Dry run（不实际发布）
+uv publish --dry-run
+```
+
+#### uv 完整工作流
+
+```bash
+# 1. 初始化项目
+uv init my-package
+cd my-package
+
+# 2. 添加依赖
+uv add requests "pydantic>=2.0"
+uv add --dev pytest pytest-cov mypy ruff
+
+# 3. 开发与测试
+uv run pytest
+uv run mypy src/
+uv run ruff check src/
+
+# 4. 更新版本（手动编辑 pyproject.toml 或使用工具）
+# 编辑 pyproject.toml 中的 version = "1.0.1"
+
+# 5. 构建
+uv build
+
+# 6. 发布到 TestPyPI 测试
+uv publish --publish-url https://test.pypi.org/legacy/ --token $TEST_PYPI_TOKEN
+
+# 7. 测试安装
+uv pip install --index-url https://test.pypi.org/simple/ my-package
+
+# 8. 正式发布到 PyPI
+uv publish --token $PYPI_TOKEN
+
+# 9. 清理构建产物
+rm -rf dist/ build/ *.egg-info/
+```
+
+#### uv 项目配置 (pyproject.toml)
+
+```toml
+[project]
+name = "my-package"
+version = "1.0.0"
+description = "My awesome package"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your@email.com"}
+]
+dependencies = [
+    "requests>=2.28.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# uv 特定配置
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.uv.sources]
+# 配置依赖源
+# my-private-package = { index = "private" }
+
+[[tool.uv.index]]
+name = "private"
+url = "https://pypi.mycompany.com/simple/"
+# explicit = true  # 仅用于明确指定的包
+```
+
+#### uv 环境变量与配置
+
+```bash
+# ============ 环境变量 ============
+
+# PyPI Token
+export UV_PUBLISH_TOKEN="pypi-xxx..."
+
+# 发布 URL
+export UV_PUBLISH_URL="https://upload.pypi.org/legacy/"
+
+# 私有仓库认证
+export UV_PUBLISH_USERNAME="myuser"
+export UV_PUBLISH_PASSWORD="mypassword"
+
+# 索引 URL
+export UV_INDEX_URL="https://pypi.org/simple/"
+export UV_EXTRA_INDEX_URL="https://pypi.mycompany.com/simple/"
+
+# 缓存目录
+export UV_CACHE_DIR="$HOME/.cache/uv"
+
+# 禁用缓存
+export UV_NO_CACHE=1
+
+# ============ 配置文件 ============
+# ~/.config/uv/uv.toml 或项目根目录的 uv.toml
+
+# uv.toml
+[pip]
+index-url = "https://pypi.org/simple/"
+extra-index-url = ["https://pypi.mycompany.com/simple/"]
+trusted-host = ["pypi.mycompany.com"]
+
+[publish]
+url = "https://upload.pypi.org/legacy/"
+# token = "pypi-xxx..."  # 不建议在文件中存储 token
+```
+
+#### uv vs pip/twine 对比
+
+| 功能 | pip/twine | uv |
+|------|-----------|-----|
+| 依赖安装 | `pip install` | `uv pip install` / `uv add` |
+| 虚拟环境 | `python -m venv` | `uv venv` |
+| 依赖锁定 | `pip freeze` | `uv lock` |
+| 构建 | `python -m build` | `uv build` |
+| 发布 | `twine upload` | `uv publish` |
+| 速度 | 较慢 | 10-100x 更快 |
+| 依赖解析 | 基础 | 高级（类似 Cargo） |
+| Lock 文件 | requirements.txt | uv.lock |
+
 ### 6. pip 配置 (~/.pip/pip.conf)
 
 ```ini
@@ -589,6 +815,23 @@ trusted-host = pypi.mycompany.com
 
 [install]
 trusted-host = pypi.mycompany.com
+```
+
+### 7. uv 配置 (~/.config/uv/uv.toml)
+
+```toml
+[pip]
+index-url = "https://pypi.org/simple/"
+extra-index-url = ["https://pypi.mycompany.com/simple/"]
+trusted-host = ["pypi.mycompany.com"]
+
+[venv]
+# 默认 Python 版本
+python = "3.11"
+
+[cache]
+# 缓存目录
+dir = "~/.cache/uv"
 ```
 
 ### 7. .pypirc 配置 (~/.pypirc)
@@ -1736,8 +1979,36 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  # ============ Python ============
+  # ============ Python (使用 uv) ============
   release-pypi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+      
+      - name: Test
+        run: uv run pytest
+      
+      - name: Build
+        run: uv build
+      
+      - name: Publish to PyPI
+        run: uv publish --token ${{ secrets.PYPI_TOKEN }}
+
+  # ============ Python (使用 twine，备选) ============
+  release-pypi-twine:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
