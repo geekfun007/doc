@@ -7,13 +7,14 @@
 1. [快速开始](#快速开始)
 2. [模型定义](#模型定义)
 3. [CRUD 操作](#crud-操作)
-4. [查询详解](#查询详解)
-5. [关联关系](#关联关系)
-6. [事务处理](#事务处理)
-7. [钩子函数](#钩子函数)
-8. [高级特性](#高级特性)
-9. [性能优化](#性能优化)
-10. [底层原理](#底层原理)
+4. [GORM 查询语法与占位符](#gorm-查询语法与占位符)
+5. [查询详解](#查询详解)
+6. [关联关系](#关联关系)
+7. [事务处理](#事务处理)
+8. [钩子函数](#钩子函数)
+9. [高级特性](#高级特性)
+10. [性能优化](#性能优化)
+11. [底层原理](#底层原理)
 
 ---
 
@@ -497,6 +498,509 @@ db.Where("status = ?", "inactive").Delete(&User{})
 // 阻止全表删除
 db.Delete(&User{}) // 会报错：WHERE conditions required
 db.Where("1 = 1").Delete(&User{}) // 显式删除全表
+```
+
+---
+
+## GORM 查询语法与占位符
+
+### 占位符 `?` 详解
+
+GORM 使用 `?` 作为参数占位符，支持多种查询方式：
+
+```go
+// ============ 基本占位符 ============
+
+// 单个 ?
+db.Where("name = ?", "Alice").Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice'
+
+// 多个 ?（按顺序匹配）
+db.Where("name = ? AND age = ?", "Alice", 18).Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice' AND age = 18
+
+// IN 查询（? 自动展开切片）
+db.Where("id IN ?", []int{1, 2, 3}).Find(&users)
+// SQL: SELECT * FROM users WHERE id IN (1, 2, 3)
+
+// BETWEEN
+db.Where("age BETWEEN ? AND ?", 18, 30).Find(&users)
+// SQL: SELECT * FROM users WHERE age BETWEEN 18 AND 30
+
+// LIKE
+db.Where("name LIKE ?", "%Alice%").Find(&users)
+// SQL: SELECT * FROM users WHERE name LIKE '%Alice%'
+
+// IS NULL（不需要占位符）
+db.Where("deleted_at IS NULL").Find(&users)
+
+// ============ 避免 SQL 注入 ============
+
+// ✅ 安全：使用占位符
+name := userInput
+db.Where("name = ?", name).Find(&users)
+
+// ❌ 危险：字符串拼接
+db.Where("name = '" + name + "'").Find(&users) // SQL 注入风险！
+
+// ❌ 危险：fmt.Sprintf
+db.Where(fmt.Sprintf("name = '%s'", name)).Find(&users) // SQL 注入风险！
+```
+
+### 命名参数
+
+```go
+// 使用 @name 命名参数
+db.Where("name = @name AND age = @age", sql.Named("name", "Alice"), sql.Named("age", 18)).Find(&users)
+
+// 使用 map 命名参数
+db.Where("name = @name AND age = @age", map[string]interface{}{
+    "name": "Alice",
+    "age":  18,
+}).Find(&users)
+
+// 在 Raw SQL 中使用
+db.Raw("SELECT * FROM users WHERE name = @name", sql.Named("name", "Alice")).Scan(&users)
+
+db.Raw("SELECT * FROM users WHERE name = @name", map[string]interface{}{
+    "name": "Alice",
+}).Scan(&users)
+```
+
+### 结构体与 Map 条件
+
+```go
+// ============ 结构体条件 ============
+
+// 结构体作为条件（只使用非零值字段）
+db.Where(&User{Name: "Alice", Age: 18}).Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice' AND age = 18
+
+// ⚠️ 零值字段会被忽略
+db.Where(&User{Name: "Alice", Age: 0}).Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice'
+// Age = 0 被忽略！
+
+// 指定要查询的字段（包括零值）
+db.Where(&User{Name: "Alice", Age: 0}, "Name", "Age").Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice' AND age = 0
+
+// 指定字段的另一种方式
+db.Where(&User{Name: "Alice"}, "Age").Find(&users)
+// SQL: SELECT * FROM users WHERE age = 0 (只使用 Age 字段)
+
+// ============ Map 条件 ============
+
+// Map 条件（包括零值）
+db.Where(map[string]interface{}{
+    "name": "Alice",
+    "age":  0,  // 会作为条件
+}).Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice' AND age = 0
+
+// Map 与切片
+db.Where(map[string]interface{}{
+    "name": []string{"Alice", "Bob"},  // 自动转为 IN
+}).Find(&users)
+// SQL: SELECT * FROM users WHERE name IN ('Alice', 'Bob')
+```
+
+### 内联条件
+
+```go
+// Find 的内联条件
+db.Find(&users, "name = ?", "Alice")
+// 等价于
+db.Where("name = ?", "Alice").Find(&users)
+
+// First 的内联条件
+db.First(&user, "name = ?", "Alice")
+
+// 主键查询
+db.First(&user, 1)                    // SELECT * FROM users WHERE id = 1
+db.First(&user, "id = ?", 1)          // 同上
+db.Find(&users, []int{1, 2, 3})       // SELECT * FROM users WHERE id IN (1, 2, 3)
+
+// 结构体内联条件
+db.Find(&users, User{Name: "Alice"})
+// SELECT * FROM users WHERE name = 'Alice'
+
+// Map 内联条件
+db.Find(&users, map[string]interface{}{"name": "Alice", "age": 18})
+```
+
+### 子查询语法
+
+```go
+// ============ WHERE 子查询 ============
+
+// IN 子查询
+subQuery := db.Model(&Order{}).Select("user_id").Where("amount > ?", 1000)
+db.Where("id IN (?)", subQuery).Find(&users)
+// SQL: SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 1000)
+
+// EXISTS 子查询
+db.Where("EXISTS (?)", db.Model(&Order{}).Select("1").Where("orders.user_id = users.id")).Find(&users)
+// SQL: SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
+
+// 比较子查询
+db.Where("age > (?)", db.Model(&User{}).Select("AVG(age)")).Find(&users)
+// SQL: SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)
+
+// ============ FROM 子查询 ============
+
+// 子查询作为表
+subQuery := db.Model(&Order{}).Select("user_id, SUM(amount) as total").Group("user_id")
+db.Table("(?) as order_totals", subQuery).Where("total > ?", 1000).Find(&results)
+// SQL: SELECT * FROM (SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id) as order_totals WHERE total > 1000
+
+// ============ SELECT 子查询 ============
+
+// 子查询作为字段
+db.Model(&User{}).Select(
+    "users.*",
+    "(?) as order_count", db.Model(&Order{}).Select("COUNT(*)").Where("orders.user_id = users.id"),
+    "(?) as total_amount", db.Model(&Order{}).Select("COALESCE(SUM(amount), 0)").Where("orders.user_id = users.id"),
+).Find(&results)
+```
+
+### 表达式与函数
+
+```go
+// ============ gorm.Expr 表达式 ============
+
+// 更新时使用表达式
+db.Model(&product).Update("price", gorm.Expr("price * ?", 1.1))
+// SQL: UPDATE products SET price = price * 1.1 WHERE id = ?
+
+db.Model(&product).Update("stock", gorm.Expr("stock - ?", 1))
+// SQL: UPDATE products SET stock = stock - 1 WHERE id = ?
+
+// 多字段表达式更新
+db.Model(&product).Updates(map[string]interface{}{
+    "price": gorm.Expr("price * ? + ?", 1.1, 10),
+    "stock": gorm.Expr("stock - ?", 1),
+})
+
+// 查询中使用表达式
+db.Where("amount > ?", gorm.Expr("(SELECT AVG(amount) FROM orders)")).Find(&orders)
+
+// 创建时使用表达式
+db.Model(&User{}).Create(map[string]interface{}{
+    "name":       "Alice",
+    "created_at": gorm.Expr("NOW()"),
+    "uuid":       gorm.Expr("UUID()"),
+})
+
+// ============ 数据库函数 ============
+
+// 日期函数
+db.Where("DATE(created_at) = ?", "2024-01-01").Find(&orders)
+db.Where("YEAR(created_at) = ? AND MONTH(created_at) = ?", 2024, 1).Find(&orders)
+
+// 字符串函数
+db.Where("LOWER(name) = ?", "alice").Find(&users)
+db.Where("LENGTH(name) > ?", 5).Find(&users)
+db.Where("name LIKE CONCAT('%', ?, '%')", keyword).Find(&users)
+
+// 数学函数
+db.Where("ROUND(price, 2) = ?", 99.99).Find(&products)
+
+// 聚合函数（需要配合 Select）
+db.Model(&Order{}).Select("COUNT(*) as count, SUM(amount) as total").Scan(&result)
+```
+
+### Clause 语法
+
+```go
+import "gorm.io/gorm/clause"
+
+// ============ ON CONFLICT（Upsert）============
+
+// MySQL: ON DUPLICATE KEY UPDATE
+db.Clauses(clause.OnConflict{
+    Columns:   []clause.Column{{Name: "email"}},
+    DoUpdates: clause.AssignmentColumns([]string{"name", "updated_at"}),
+}).Create(&user)
+// SQL: INSERT INTO users ... ON DUPLICATE KEY UPDATE name=VALUES(name), updated_at=VALUES(updated_at)
+
+// 全部更新
+db.Clauses(clause.OnConflict{
+    UpdateAll: true,
+}).Create(&user)
+
+// 什么都不做
+db.Clauses(clause.OnConflict{
+    DoNothing: true,
+}).Create(&user)
+// SQL: INSERT INTO users ... ON DUPLICATE KEY UPDATE id=id
+
+// 条件更新
+db.Clauses(clause.OnConflict{
+    Columns:   []clause.Column{{Name: "email"}},
+    DoUpdates: clause.Assignments(map[string]interface{}{
+        "name":       gorm.Expr("VALUES(name)"),
+        "updated_at": gorm.Expr("NOW()"),
+    }),
+}).Create(&user)
+
+// ============ RETURNING ============
+
+// PostgreSQL: RETURNING
+db.Clauses(clause.Returning{Columns: []clause.Column{{Name: "id"}, {Name: "created_at"}}}).Create(&user)
+// SQL: INSERT INTO users ... RETURNING id, created_at
+
+// 返回所有字段
+db.Clauses(clause.Returning{}).Create(&user)
+// SQL: INSERT INTO users ... RETURNING *
+
+// ============ Locking ============
+
+// FOR UPDATE
+db.Clauses(clause.Locking{Strength: "UPDATE"}).Find(&users)
+// SQL: SELECT * FROM users FOR UPDATE
+
+// FOR SHARE
+db.Clauses(clause.Locking{Strength: "SHARE"}).Find(&users)
+// SQL: SELECT * FROM users FOR SHARE
+
+// NOWAIT
+db.Clauses(clause.Locking{Strength: "UPDATE", Options: "NOWAIT"}).Find(&users)
+// SQL: SELECT * FROM users FOR UPDATE NOWAIT
+
+// SKIP LOCKED
+db.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Find(&users)
+// SQL: SELECT * FROM users FOR UPDATE SKIP LOCKED
+
+// 指定表
+db.Clauses(clause.Locking{
+    Strength: "UPDATE",
+    Table:    clause.Table{Name: clause.CurrentTable},
+}).Joins("Profile").Find(&users)
+// SQL: SELECT * FROM users ... FOR UPDATE OF users
+
+// ============ Hints ============
+
+// 索引提示
+db.Clauses(hints.UseIndex("idx_name")).Find(&users)
+// SQL: SELECT * FROM users USE INDEX (idx_name)
+
+db.Clauses(hints.ForceIndex("idx_name")).Find(&users)
+// SQL: SELECT * FROM users FORCE INDEX (idx_name)
+
+// 优化器提示
+db.Clauses(hints.New("MAX_EXECUTION_TIME(1000)")).Find(&users)
+// SQL: SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM users
+```
+
+### 条件组合
+
+```go
+// ============ Where / Or / Not 组合 ============
+
+// AND 组合
+db.Where("name = ?", "Alice").Where("age > ?", 18).Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice' AND age > 18
+
+// OR 组合
+db.Where("name = ?", "Alice").Or("name = ?", "Bob").Find(&users)
+// SQL: SELECT * FROM users WHERE name = 'Alice' OR name = 'Bob'
+
+// NOT 条件
+db.Not("name = ?", "Alice").Find(&users)
+// SQL: SELECT * FROM users WHERE NOT name = 'Alice'
+
+db.Not(User{Name: "Alice"}).Find(&users)
+// SQL: SELECT * FROM users WHERE name != 'Alice'
+
+db.Not(map[string]interface{}{"name": []string{"Alice", "Bob"}}).Find(&users)
+// SQL: SELECT * FROM users WHERE name NOT IN ('Alice', 'Bob')
+
+// ============ 复杂条件组合 ============
+
+// 使用 Group 组合条件
+db.Where(
+    db.Where("name = ?", "Alice").Or("name = ?", "Bob"),
+).Where("age > ?", 18).Find(&users)
+// SQL: SELECT * FROM users WHERE (name = 'Alice' OR name = 'Bob') AND age > 18
+
+// 使用 Session 构建子条件
+condition1 := db.Session(&gorm.Session{NewDB: true}).Where("name = ?", "Alice").Or("name = ?", "Bob")
+condition2 := db.Session(&gorm.Session{NewDB: true}).Where("status = ?", "active")
+
+db.Where(condition1).Where(condition2).Find(&users)
+// SQL: SELECT * FROM users WHERE (name = 'Alice' OR name = 'Bob') AND status = 'active'
+
+// ============ 动态条件构建 ============
+
+func BuildQuery(db *gorm.DB, filters map[string]interface{}) *gorm.DB {
+    if name, ok := filters["name"]; ok && name != "" {
+        db = db.Where("name LIKE ?", "%"+name.(string)+"%")
+    }
+    if status, ok := filters["status"]; ok && status != "" {
+        db = db.Where("status = ?", status)
+    }
+    if minAge, ok := filters["min_age"]; ok {
+        db = db.Where("age >= ?", minAge)
+    }
+    if maxAge, ok := filters["max_age"]; ok {
+        db = db.Where("age <= ?", maxAge)
+    }
+    if ids, ok := filters["ids"]; ok {
+        db = db.Where("id IN ?", ids)
+    }
+    return db
+}
+
+// 使用
+query := BuildQuery(db.Model(&User{}), map[string]interface{}{
+    "name":    "Alice",
+    "status":  "active",
+    "min_age": 18,
+})
+query.Find(&users)
+```
+
+### 特殊查询语法
+
+```go
+// ============ DISTINCT ============
+db.Distinct("name", "age").Find(&users)
+// SQL: SELECT DISTINCT name, age FROM users
+
+db.Model(&User{}).Distinct().Count(&count)
+// SQL: SELECT COUNT(DISTINCT id) FROM users
+
+// ============ GROUP BY / HAVING ============
+db.Model(&Order{}).
+    Select("user_id, SUM(amount) as total, COUNT(*) as count").
+    Group("user_id").
+    Having("total > ? AND count > ?", 1000, 5).
+    Find(&results)
+// SQL: SELECT user_id, SUM(amount) as total, COUNT(*) as count 
+//      FROM orders GROUP BY user_id HAVING total > 1000 AND count > 5
+
+// ============ ORDER BY ============
+db.Order("created_at DESC, name ASC").Find(&users)
+db.Order("FIELD(status, 'pending', 'active', 'inactive')").Find(&users)
+db.Order(clause.OrderByColumn{Column: clause.Column{Name: "created_at"}, Desc: true}).Find(&users)
+
+// ============ LIMIT / OFFSET ============
+db.Limit(10).Offset(20).Find(&users)
+// SQL: SELECT * FROM users LIMIT 10 OFFSET 20
+
+// 取消 Limit
+db.Limit(10).Find(&users1).Limit(-1).Find(&users2)
+
+// ============ 联合查询 UNION ============
+db.Raw("? UNION ?",
+    db.Model(&User{}).Select("name", "email").Where("status = ?", "active"),
+    db.Model(&Admin{}).Select("name", "email").Where("status = ?", "active"),
+).Scan(&results)
+
+// ============ Pluck 获取单列 ============
+var names []string
+db.Model(&User{}).Pluck("name", &names)
+// SQL: SELECT name FROM users
+
+var ids []int
+db.Model(&User{}).Where("status = ?", "active").Pluck("id", &ids)
+
+// ============ Scan 到指定结构 ============
+type Result struct {
+    Name  string
+    Total int64
+}
+var results []Result
+db.Model(&Order{}).Select("users.name, SUM(orders.amount) as total").
+    Joins("LEFT JOIN users ON users.id = orders.user_id").
+    Group("users.name").
+    Scan(&results)
+
+// ============ 智能选择字段 ============
+type APIUser struct {
+    ID   uint
+    Name string
+}
+// 只查询结构体中的字段
+db.Model(&User{}).Find(&[]APIUser{})
+// SQL: SELECT id, name FROM users
+```
+
+### 常见查询模式
+
+```go
+// ============ 分页查询 ============
+type Pagination struct {
+    Page     int
+    PageSize int
+    Total    int64
+    Data     interface{}
+}
+
+func Paginate(db *gorm.DB, page, pageSize int, dest interface{}) (*Pagination, error) {
+    var total int64
+    
+    // 计算总数
+    if err := db.Count(&total).Error; err != nil {
+        return nil, err
+    }
+    
+    // 分页查询
+    offset := (page - 1) * pageSize
+    if err := db.Offset(offset).Limit(pageSize).Find(dest).Error; err != nil {
+        return nil, err
+    }
+    
+    return &Pagination{
+        Page:     page,
+        PageSize: pageSize,
+        Total:    total,
+        Data:     dest,
+    }, nil
+}
+
+// ============ 存在性检查 ============
+func Exists(db *gorm.DB, model interface{}, query interface{}, args ...interface{}) (bool, error) {
+    var count int64
+    err := db.Model(model).Where(query, args...).Limit(1).Count(&count).Error
+    return count > 0, err
+}
+
+// 使用
+exists, _ := Exists(db, &User{}, "email = ?", "alice@example.com")
+
+// ============ 获取或创建 ============
+// FirstOrCreate
+var user User
+db.Where(User{Email: "alice@example.com"}).
+    Attrs(User{Name: "Alice", Age: 18}).  // 创建时使用
+    FirstOrCreate(&user)
+
+// FirstOrInit（只初始化不创建）
+db.Where(User{Email: "alice@example.com"}).
+    Attrs(User{Name: "Alice"}).
+    Assign(User{Age: 20}).  // 无论找到与否都赋值
+    FirstOrInit(&user)
+
+// ============ 批量更新并返回 ============
+var updatedUsers []User
+db.Model(&User{}).
+    Where("status = ?", "inactive").
+    Update("status", "active").
+    Find(&updatedUsers, "status = ?", "active")
+
+// ============ 安全删除检查 ============
+func SafeDelete(db *gorm.DB, model interface{}, id uint) error {
+    // 先检查是否存在
+    result := db.First(model, id)
+    if result.Error != nil {
+        return result.Error
+    }
+    
+    // 执行删除
+    return db.Delete(model, id).Error
+}
 ```
 
 ---
