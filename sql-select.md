@@ -15,7 +15,8 @@
 9. [窗口函数](#窗口函数)
 10. [CTE 公共表表达式](#cte-公共表表达式)
 11. [集合操作](#集合操作)
-12. [性能优化](#性能优化)
+12. [MySQL JSON 操作](#mysql-json-操作)
+13. [性能优化](#性能优化)
 
 ---
 
@@ -1238,6 +1239,548 @@ SELECT user_id FROM orders_2024;
 SELECT DISTINCT user_id FROM orders_2023
 WHERE user_id NOT IN (SELECT user_id FROM orders_2024);
 ```
+
+---
+
+## MySQL JSON 操作
+
+### JSON 数据类型
+
+```sql
+-- 创建包含 JSON 列的表
+CREATE TABLE users (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100),
+    profile JSON,
+    settings JSON,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 插入 JSON 数据
+INSERT INTO users (name, profile, settings) VALUES
+('Alice', '{"age": 25, "city": "Beijing", "tags": ["developer", "gamer"]}', '{"theme": "dark", "notifications": true}'),
+('Bob', '{"age": 30, "city": "Shanghai", "tags": ["designer"]}', '{"theme": "light", "notifications": false}');
+
+-- 使用 JSON 函数构造
+INSERT INTO users (name, profile) VALUES
+('Carol', JSON_OBJECT('age', 28, 'city', 'Shenzhen', 'tags', JSON_ARRAY('manager', 'reader')));
+```
+
+### JSON 路径语法
+
+```sql
+-- JSON 路径表达式
+-- $           - 根对象
+-- $.key       - 对象属性
+-- $[index]    - 数组元素（从 0 开始）
+-- $.key[index] - 嵌套访问
+-- $.*         - 对象所有成员
+-- $[*]        - 数组所有元素
+-- $**.key     - 递归搜索所有 key
+
+-- 路径示例
+-- $.name              - 获取 name 属性
+-- $.address.city      - 获取嵌套的 city
+-- $.tags[0]           - 获取 tags 数组第一个元素
+-- $.tags[last]        - 获取 tags 数组最后一个元素（MySQL 8.0.21+）
+-- $.items[*].name     - 获取 items 数组中所有元素的 name
+```
+
+### JSON 提取函数
+
+```sql
+-- JSON_EXTRACT：提取 JSON 值
+SELECT JSON_EXTRACT(profile, '$.age') FROM users;
+SELECT JSON_EXTRACT(profile, '$.city') FROM users;
+SELECT JSON_EXTRACT(profile, '$.tags[0]') FROM users;
+
+-- -> 操作符（JSON_EXTRACT 的简写）
+SELECT profile->'$.age' FROM users;
+SELECT profile->'$.city' FROM users;
+SELECT profile->'$.tags[0]' FROM users;
+
+-- ->> 操作符（提取并去除引号，返回字符串）
+SELECT profile->>'$.city' FROM users;  -- 返回 Beijing 而不是 "Beijing"
+SELECT JSON_UNQUOTE(JSON_EXTRACT(profile, '$.city')) FROM users;  -- 等价写法
+
+-- 提取多个路径
+SELECT JSON_EXTRACT(profile, '$.age', '$.city') FROM users;
+-- 返回 [25, "Beijing"]
+
+-- 嵌套 JSON 提取
+SELECT 
+    name,
+    profile->>'$.city' AS city,
+    profile->'$.tags' AS tags,
+    profile->'$.tags[0]' AS first_tag
+FROM users;
+```
+
+### JSON 查询条件
+
+```sql
+-- 基于 JSON 字段查询
+SELECT * FROM users WHERE profile->>'$.city' = 'Beijing';
+SELECT * FROM users WHERE profile->'$.age' > 25;
+
+-- JSON_CONTAINS：检查是否包含指定值
+-- 检查 tags 数组是否包含 "developer"
+SELECT * FROM users 
+WHERE JSON_CONTAINS(profile->'$.tags', '"developer"');
+
+-- 检查对象是否包含指定键值对
+SELECT * FROM users
+WHERE JSON_CONTAINS(profile, '{"city": "Beijing"}');
+
+-- JSON_CONTAINS_PATH：检查路径是否存在
+-- 'one'：任一路径存在即可
+-- 'all'：所有路径都必须存在
+SELECT * FROM users
+WHERE JSON_CONTAINS_PATH(profile, 'one', '$.age', '$.email');
+
+SELECT * FROM users
+WHERE JSON_CONTAINS_PATH(profile, 'all', '$.age', '$.city');
+
+-- JSON_OVERLAPS：检查两个 JSON 是否有重叠元素（MySQL 8.0.17+）
+SELECT * FROM users
+WHERE JSON_OVERLAPS(profile->'$.tags', '["developer", "manager"]');
+
+-- JSON_MEMBER_OF：检查值是否是数组成员（MySQL 8.0.17+）
+SELECT * FROM users
+WHERE 'developer' MEMBER OF(profile->'$.tags');
+
+-- JSON_VALUE：提取标量值并指定类型（MySQL 8.0.21+）
+SELECT JSON_VALUE(profile, '$.age' RETURNING SIGNED) AS age FROM users;
+SELECT JSON_VALUE(profile, '$.city' RETURNING CHAR(50)) AS city FROM users;
+```
+
+### JSON 搜索函数
+
+```sql
+-- JSON_SEARCH：搜索字符串值的路径
+-- 'one'：返回第一个匹配的路径
+-- 'all'：返回所有匹配的路径
+
+-- 在 profile 中搜索值 "Beijing"
+SELECT JSON_SEARCH(profile, 'one', 'Beijing') FROM users;
+-- 返回 "$.city"
+
+-- 搜索包含 "dev" 的值（使用通配符）
+SELECT JSON_SEARCH(profile, 'all', '%dev%') FROM users;
+
+-- JSON_KEYS：获取对象的所有键
+SELECT JSON_KEYS(profile) FROM users;
+-- 返回 ["age", "city", "tags"]
+
+-- 获取嵌套对象的键
+SELECT JSON_KEYS(profile, '$.address') FROM users;
+```
+
+### JSON 修改函数
+
+```sql
+-- JSON_SET：设置值（存在则更新，不存在则插入）
+UPDATE users 
+SET profile = JSON_SET(profile, '$.age', 26, '$.email', 'alice@example.com')
+WHERE name = 'Alice';
+
+-- JSON_INSERT：仅插入新值（已存在的不更新）
+UPDATE users
+SET profile = JSON_INSERT(profile, '$.age', 99, '$.phone', '123456')
+WHERE name = 'Alice';
+-- age 不会变成 99（因为已存在），phone 会被添加
+
+-- JSON_REPLACE：仅更新已存在的值（不存在的不插入）
+UPDATE users
+SET profile = JSON_REPLACE(profile, '$.age', 27, '$.nonexistent', 'value')
+WHERE name = 'Alice';
+-- age 会更新，nonexistent 不会被添加
+
+-- JSON_REMOVE：删除指定路径
+UPDATE users
+SET profile = JSON_REMOVE(profile, '$.email', '$.phone')
+WHERE name = 'Alice';
+
+-- 数组操作
+-- JSON_ARRAY_APPEND：向数组追加元素
+UPDATE users
+SET profile = JSON_ARRAY_APPEND(profile, '$.tags', 'blogger')
+WHERE name = 'Alice';
+
+-- JSON_ARRAY_INSERT：在数组指定位置插入元素
+UPDATE users
+SET profile = JSON_ARRAY_INSERT(profile, '$.tags[0]', 'first_tag')
+WHERE name = 'Alice';
+```
+
+### JSON 聚合函数
+
+```sql
+-- JSON_ARRAYAGG：聚合为 JSON 数组
+SELECT 
+    department,
+    JSON_ARRAYAGG(name) AS members
+FROM employees
+GROUP BY department;
+-- 返回：{"department": "IT", "members": ["Alice", "Bob", "Carol"]}
+
+-- JSON_OBJECTAGG：聚合为 JSON 对象
+SELECT 
+    department,
+    JSON_OBJECTAGG(name, salary) AS salaries
+FROM employees
+GROUP BY department;
+-- 返回：{"department": "IT", "salaries": {"Alice": 5000, "Bob": 6000}}
+
+-- 结合其他聚合
+SELECT 
+    JSON_OBJECT(
+        'total_users', COUNT(*),
+        'cities', JSON_ARRAYAGG(DISTINCT profile->>'$.city'),
+        'avg_age', AVG(profile->'$.age')
+    ) AS stats
+FROM users;
+```
+
+### JSON 创建函数
+
+```sql
+-- JSON_OBJECT：创建 JSON 对象
+SELECT JSON_OBJECT('name', 'Alice', 'age', 25);
+-- 返回 {"name": "Alice", "age": 25}
+
+-- JSON_ARRAY：创建 JSON 数组
+SELECT JSON_ARRAY('apple', 'banana', 'cherry');
+-- 返回 ["apple", "banana", "cherry"]
+
+-- JSON_QUOTE：将字符串转为 JSON 字符串
+SELECT JSON_QUOTE('Hello "World"');
+-- 返回 "Hello \"World\""
+
+-- JSON_UNQUOTE：去除 JSON 字符串的引号
+SELECT JSON_UNQUOTE('"Hello World"');
+-- 返回 Hello World
+
+-- 嵌套构造
+SELECT JSON_OBJECT(
+    'user', JSON_OBJECT('name', 'Alice', 'age', 25),
+    'tags', JSON_ARRAY('developer', 'gamer'),
+    'active', TRUE
+);
+```
+
+### JSON 工具函数
+
+```sql
+-- JSON_TYPE：返回 JSON 值的类型
+SELECT JSON_TYPE('{"a": 1}');        -- OBJECT
+SELECT JSON_TYPE('[1, 2, 3]');       -- ARRAY
+SELECT JSON_TYPE('"hello"');         -- STRING
+SELECT JSON_TYPE('123');             -- INTEGER
+SELECT JSON_TYPE('123.45');          -- DOUBLE
+SELECT JSON_TYPE('true');            -- BOOLEAN
+SELECT JSON_TYPE('null');            -- NULL
+
+-- JSON_VALID：检查是否是有效的 JSON
+SELECT JSON_VALID('{"name": "Alice"}');  -- 1
+SELECT JSON_VALID('{invalid}');          -- 0
+
+-- JSON_LENGTH：返回 JSON 文档的长度
+SELECT JSON_LENGTH('{"a": 1, "b": 2}');     -- 2（对象属性数）
+SELECT JSON_LENGTH('[1, 2, 3, 4]');         -- 4（数组元素数）
+SELECT JSON_LENGTH('{"a": [1, 2, 3]}', '$.a');  -- 3
+
+-- JSON_DEPTH：返回最大深度
+SELECT JSON_DEPTH('{"a": {"b": {"c": 1}}}');  -- 4
+
+-- JSON_PRETTY：格式化输出（易读）
+SELECT JSON_PRETTY('{"name":"Alice","age":25}');
+-- 返回：
+-- {
+--   "name": "Alice",
+--   "age": 25
+-- }
+
+-- JSON_STORAGE_SIZE：返回存储大小（字节）
+SELECT JSON_STORAGE_SIZE(profile) FROM users;
+
+-- JSON_STORAGE_FREE：返回释放的空间（部分更新后）
+SELECT JSON_STORAGE_FREE(profile) FROM users;
+```
+
+### JSON 合并函数
+
+```sql
+-- JSON_MERGE_PRESERVE：合并 JSON（保留重复键的所有值）
+SELECT JSON_MERGE_PRESERVE('{"a": 1}', '{"a": 2, "b": 3}');
+-- 返回 {"a": [1, 2], "b": 3}
+
+-- JSON_MERGE_PATCH：合并 JSON（后者覆盖前者，RFC 7396）
+SELECT JSON_MERGE_PATCH('{"a": 1, "b": 2}', '{"a": 3, "c": 4}');
+-- 返回 {"a": 3, "b": 2, "c": 4}
+
+-- 数组合并
+SELECT JSON_MERGE_PRESERVE('[1, 2]', '[3, 4]');
+-- 返回 [1, 2, 3, 4]
+```
+
+### JSON 索引优化
+
+```sql
+-- 方法 1：生成列 + 索引
+ALTER TABLE users
+ADD COLUMN city VARCHAR(100) GENERATED ALWAYS AS (profile->>'$.city') STORED,
+ADD INDEX idx_city (city);
+
+-- 查询时可以使用索引
+SELECT * FROM users WHERE city = 'Beijing';
+
+-- 方法 2：函数索引（MySQL 8.0.13+）
+CREATE INDEX idx_profile_city ON users ((CAST(profile->>'$.city' AS CHAR(100))));
+
+-- 方法 3：多值索引（MySQL 8.0.17+，用于数组）
+CREATE TABLE products (
+    id INT PRIMARY KEY,
+    name VARCHAR(100),
+    tags JSON,
+    INDEX idx_tags ((CAST(tags AS CHAR(100) ARRAY)))
+);
+
+-- 使用多值索引查询
+SELECT * FROM products WHERE 'electronics' MEMBER OF(tags);
+
+-- 查看执行计划
+EXPLAIN SELECT * FROM users WHERE profile->>'$.city' = 'Beijing';
+```
+
+### JSON 实战示例
+
+#### 用户配置存储
+
+```sql
+-- 表结构
+CREATE TABLE user_preferences (
+    user_id INT PRIMARY KEY,
+    preferences JSON DEFAULT '{}',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 初始化默认配置
+INSERT INTO user_preferences (user_id, preferences) VALUES
+(1, JSON_OBJECT(
+    'theme', 'light',
+    'language', 'zh-CN',
+    'notifications', JSON_OBJECT(
+        'email', true,
+        'push', true,
+        'sms', false
+    ),
+    'dashboard', JSON_OBJECT(
+        'widgets', JSON_ARRAY('calendar', 'tasks', 'weather'),
+        'layout', 'grid'
+    )
+));
+
+-- 更新单个设置
+UPDATE user_preferences
+SET preferences = JSON_SET(preferences, '$.theme', 'dark')
+WHERE user_id = 1;
+
+-- 更新嵌套设置
+UPDATE user_preferences
+SET preferences = JSON_SET(preferences, '$.notifications.sms', true)
+WHERE user_id = 1;
+
+-- 添加新的 widget
+UPDATE user_preferences
+SET preferences = JSON_ARRAY_APPEND(preferences, '$.dashboard.widgets', 'notes')
+WHERE user_id = 1;
+
+-- 查询特定设置
+SELECT 
+    user_id,
+    preferences->>'$.theme' AS theme,
+    preferences->>'$.language' AS language,
+    preferences->'$.notifications.email' AS email_notifications
+FROM user_preferences;
+```
+
+#### 订单商品明细
+
+```sql
+-- 表结构
+CREATE TABLE orders (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT,
+    items JSON,
+    total DECIMAL(10, 2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 插入订单
+INSERT INTO orders (user_id, items, total) VALUES
+(1, '[
+    {"product_id": 101, "name": "iPhone", "price": 999, "quantity": 1},
+    {"product_id": 102, "name": "AirPods", "price": 199, "quantity": 2}
+]', 1397);
+
+-- 查询包含特定商品的订单
+SELECT * FROM orders
+WHERE JSON_CONTAINS(items, '{"product_id": 101}');
+
+-- 查询订单中的商品数量
+SELECT id, JSON_LENGTH(items) AS item_count FROM orders;
+
+-- 提取所有商品名称
+SELECT 
+    id,
+    JSON_EXTRACT(items, '$[*].name') AS product_names
+FROM orders;
+
+-- 计算订单中每个商品的小计
+SELECT 
+    id,
+    JSON_EXTRACT(items, '$[*].name') AS names,
+    JSON_EXTRACT(items, '$[*].price') AS prices,
+    JSON_EXTRACT(items, '$[*].quantity') AS quantities
+FROM orders;
+
+-- 使用 JSON_TABLE 展开数组（MySQL 8.0+）
+SELECT 
+    o.id AS order_id,
+    j.product_id,
+    j.name,
+    j.price,
+    j.quantity,
+    j.price * j.quantity AS subtotal
+FROM orders o,
+JSON_TABLE(o.items, '$[*]' COLUMNS (
+    product_id INT PATH '$.product_id',
+    name VARCHAR(100) PATH '$.name',
+    price DECIMAL(10,2) PATH '$.price',
+    quantity INT PATH '$.quantity'
+)) AS j;
+```
+
+#### 日志与审计
+
+```sql
+-- 审计日志表
+CREATE TABLE audit_logs (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    table_name VARCHAR(100),
+    record_id INT,
+    action ENUM('INSERT', 'UPDATE', 'DELETE'),
+    old_data JSON,
+    new_data JSON,
+    changed_fields JSON,
+    user_id INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_table_record (table_name, record_id),
+    INDEX idx_created_at (created_at)
+);
+
+-- 记录更新操作
+INSERT INTO audit_logs (table_name, record_id, action, old_data, new_data, changed_fields, user_id)
+VALUES (
+    'users',
+    1,
+    'UPDATE',
+    '{"name": "Alice", "email": "old@example.com"}',
+    '{"name": "Alice", "email": "new@example.com"}',
+    '["email"]',
+    100
+);
+
+-- 查询特定字段的变更历史
+SELECT * FROM audit_logs
+WHERE JSON_CONTAINS(changed_fields, '"email"');
+
+-- 查询特定记录的完整历史
+SELECT 
+    action,
+    old_data,
+    new_data,
+    changed_fields,
+    created_at
+FROM audit_logs
+WHERE table_name = 'users' AND record_id = 1
+ORDER BY created_at DESC;
+```
+
+### JSON_TABLE 详解
+
+```sql
+-- JSON_TABLE：将 JSON 数据转换为关系表
+-- 语法：
+JSON_TABLE(
+    json_doc,
+    path COLUMNS (
+        column_name data_type PATH json_path [DEFAULT default_value] [ON EMPTY] [ON ERROR],
+        ...
+    )
+)
+
+-- 基本示例
+SELECT * FROM JSON_TABLE(
+    '[{"name": "Alice", "age": 25}, {"name": "Bob", "age": 30}]',
+    '$[*]' COLUMNS (
+        name VARCHAR(100) PATH '$.name',
+        age INT PATH '$.age'
+    )
+) AS jt;
+
+-- 处理嵌套数组
+SET @json = '{
+    "store": "Electronics",
+    "products": [
+        {"name": "Phone", "variants": [{"color": "black", "price": 999}, {"color": "white", "price": 999}]},
+        {"name": "Tablet", "variants": [{"color": "silver", "price": 799}]}
+    ]
+}';
+
+SELECT * FROM JSON_TABLE(
+    @json,
+    '$.products[*]' COLUMNS (
+        product_name VARCHAR(100) PATH '$.name',
+        NESTED PATH '$.variants[*]' COLUMNS (
+            color VARCHAR(50) PATH '$.color',
+            price DECIMAL(10,2) PATH '$.price'
+        )
+    )
+) AS jt;
+
+-- 处理缺失值
+SELECT * FROM JSON_TABLE(
+    '[{"name": "Alice"}, {"name": "Bob", "email": "bob@example.com"}]',
+    '$[*]' COLUMNS (
+        name VARCHAR(100) PATH '$.name',
+        email VARCHAR(100) PATH '$.email' DEFAULT 'N/A' ON EMPTY
+    )
+) AS jt;
+
+-- 生成行号
+SELECT * FROM JSON_TABLE(
+    '[{"name": "A"}, {"name": "B"}, {"name": "C"}]',
+    '$[*]' COLUMNS (
+        row_num FOR ORDINALITY,
+        name VARCHAR(100) PATH '$.name'
+    )
+) AS jt;
+```
+
+### JSON 与其他数据库对比
+
+| 功能 | MySQL | PostgreSQL |
+|------|-------|------------|
+| 数据类型 | JSON | JSON, JSONB |
+| 提取操作符 | `->`, `->>` | `->`, `->>`, `#>`, `#>>` |
+| 包含检查 | `JSON_CONTAINS()` | `@>`, `<@` |
+| 存在检查 | `JSON_CONTAINS_PATH()` | `?`, `?|`, `?&` |
+| 数组元素检查 | `MEMBER OF()` | `@>` |
+| 索引支持 | 生成列/函数索引 | GIN 索引 |
+| 部分更新 | JSON_SET 等 | `jsonb_set()` |
+| 表展开 | JSON_TABLE | `jsonb_to_recordset()` |
 
 ---
 
