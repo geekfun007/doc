@@ -15,8 +15,9 @@
 9. [Kitex 服务端开发](#kitex-服务端开发)
 10. [Kitex 客户端开发](#kitex-客户端开发)
 11. [Kitex 高级特性](#kitex-高级特性)
-12. [Hertz + Kitex 微服务实战](#hertz--kitex-微服务实战)
-13. [性能优化与最佳实践](#性能优化与最佳实践)
+12. [GORM MySQL 数据库集成](#gorm-mysql-数据库集成)
+13. [Hertz + Kitex 微服务实战](#hertz--kitex-微服务实战)
+14. [性能优化与最佳实践](#性能优化与最佳实践)
 
 ---
 
@@ -2526,6 +2527,1208 @@ svr := userservice.NewServer(
     }),
     server.WithMuxTransport(), // 使用多路复用
 )
+```
+
+---
+
+## GORM MySQL 数据库集成
+
+本节详细介绍如何在 Hertz/Kitex 微服务中集成 GORM 和 MySQL，包括连接配置、模型定义、CRUD 操作、事务处理等。
+
+### 安装与配置
+
+```bash
+# 安装 GORM 和 MySQL 驱动
+go get -u gorm.io/gorm
+go get -u gorm.io/driver/mysql
+```
+
+### 数据库连接
+
+```go
+package db
+
+import (
+    "fmt"
+    "log"
+    "time"
+
+    "gorm.io/driver/mysql"
+    "gorm.io/gorm"
+    "gorm.io/gorm/logger"
+    "gorm.io/gorm/schema"
+)
+
+// Config 数据库配置
+type Config struct {
+    Host         string
+    Port         int
+    User         string
+    Password     string
+    DBName       string
+    MaxIdleConns int
+    MaxOpenConns int
+    MaxLifetime  time.Duration
+    LogLevel     logger.LogLevel
+}
+
+var DB *gorm.DB
+
+// Init 初始化数据库连接
+func Init(cfg *Config) error {
+    dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+        cfg.User,
+        cfg.Password,
+        cfg.Host,
+        cfg.Port,
+        cfg.DBName,
+    )
+    
+    // GORM 配置
+    gormConfig := &gorm.Config{
+        // 命名策略
+        NamingStrategy: schema.NamingStrategy{
+            TablePrefix:   "t_",     // 表前缀
+            SingularTable: true,     // 使用单数表名
+        },
+        // 日志配置
+        Logger: logger.Default.LogMode(cfg.LogLevel),
+        // 禁用默认事务（提高性能）
+        SkipDefaultTransaction: true,
+        // 预编译语句缓存
+        PrepareStmt: true,
+    }
+    
+    var err error
+    DB, err = gorm.Open(mysql.Open(dsn), gormConfig)
+    if err != nil {
+        return fmt.Errorf("failed to connect database: %w", err)
+    }
+    
+    // 获取底层 sql.DB
+    sqlDB, err := DB.DB()
+    if err != nil {
+        return fmt.Errorf("failed to get sql.DB: %w", err)
+    }
+    
+    // 连接池配置
+    sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)   // 最大空闲连接数
+    sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)   // 最大打开连接数
+    sqlDB.SetConnMaxLifetime(cfg.MaxLifetime) // 连接最大生命周期
+    
+    log.Println("Database connected successfully")
+    return nil
+}
+
+// Close 关闭数据库连接
+func Close() error {
+    sqlDB, err := DB.DB()
+    if err != nil {
+        return err
+    }
+    return sqlDB.Close()
+}
+
+// ============ 多数据库连接 ============
+type DBManager struct {
+    master  *gorm.DB
+    slaves  []*gorm.DB
+    current int
+}
+
+func NewDBManager(masterDSN string, slaveDSNs []string) (*DBManager, error) {
+    master, err := gorm.Open(mysql.Open(masterDSN), &gorm.Config{})
+    if err != nil {
+        return nil, err
+    }
+    
+    var slaves []*gorm.DB
+    for _, dsn := range slaveDSNs {
+        slave, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+        if err != nil {
+            return nil, err
+        }
+        slaves = append(slaves, slave)
+    }
+    
+    return &DBManager{
+        master: master,
+        slaves: slaves,
+    }, nil
+}
+
+// Master 获取主库（写操作）
+func (m *DBManager) Master() *gorm.DB {
+    return m.master
+}
+
+// Slave 获取从库（读操作，轮询）
+func (m *DBManager) Slave() *gorm.DB {
+    if len(m.slaves) == 0 {
+        return m.master
+    }
+    m.current = (m.current + 1) % len(m.slaves)
+    return m.slaves[m.current]
+}
+```
+
+### 模型定义
+
+```go
+package model
+
+import (
+    "database/sql"
+    "time"
+
+    "gorm.io/gorm"
+)
+
+// ============ 基础模型 ============
+type BaseModel struct {
+    ID        uint64         `gorm:"primaryKey;autoIncrement" json:"id"`
+    CreatedAt time.Time      `gorm:"autoCreateTime" json:"created_at"`
+    UpdatedAt time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"` // 软删除
+}
+
+// ============ 用户模型 ============
+type User struct {
+    BaseModel
+    Username  string         `gorm:"type:varchar(50);uniqueIndex;not null" json:"username"`
+    Email     string         `gorm:"type:varchar(100);uniqueIndex;not null" json:"email"`
+    Password  string         `gorm:"type:varchar(255);not null" json:"-"`
+    Nickname  string         `gorm:"type:varchar(50)" json:"nickname"`
+    Avatar    string         `gorm:"type:varchar(255)" json:"avatar"`
+    Phone     sql.NullString `gorm:"type:varchar(20);uniqueIndex" json:"phone"`
+    Status    int8           `gorm:"type:tinyint;default:1;index" json:"status"` // 1:正常 0:禁用
+    LastLogin *time.Time     `json:"last_login"`
+    
+    // 关联
+    Profile   *UserProfile `gorm:"foreignKey:UserID" json:"profile,omitempty"`
+    Orders    []Order      `gorm:"foreignKey:UserID" json:"orders,omitempty"`
+    Roles     []Role       `gorm:"many2many:user_roles" json:"roles,omitempty"`
+}
+
+// TableName 自定义表名
+func (User) TableName() string {
+    return "users"
+}
+
+// BeforeCreate 创建前钩子
+func (u *User) BeforeCreate(tx *gorm.DB) error {
+    // 密码加密等操作
+    return nil
+}
+
+// ============ 用户详情模型 ============
+type UserProfile struct {
+    ID       uint64 `gorm:"primaryKey" json:"id"`
+    UserID   uint64 `gorm:"uniqueIndex;not null" json:"user_id"`
+    RealName string `gorm:"type:varchar(50)" json:"real_name"`
+    IDCard   string `gorm:"type:varchar(20)" json:"id_card"`
+    Birthday *time.Time `json:"birthday"`
+    Gender   int8   `gorm:"type:tinyint;default:0" json:"gender"` // 0:未知 1:男 2:女
+    Address  string `gorm:"type:varchar(255)" json:"address"`
+    Bio      string `gorm:"type:text" json:"bio"`
+}
+
+// ============ 订单模型 ============
+type Order struct {
+    BaseModel
+    OrderNo     string    `gorm:"type:varchar(32);uniqueIndex;not null" json:"order_no"`
+    UserID      uint64    `gorm:"index;not null" json:"user_id"`
+    TotalAmount float64   `gorm:"type:decimal(10,2);not null" json:"total_amount"`
+    Status      int8      `gorm:"type:tinyint;default:0;index" json:"status"`
+    PayTime     *time.Time `json:"pay_time"`
+    
+    // 关联
+    User  *User       `gorm:"foreignKey:UserID" json:"user,omitempty"`
+    Items []OrderItem `gorm:"foreignKey:OrderID" json:"items,omitempty"`
+}
+
+type OrderItem struct {
+    ID        uint64  `gorm:"primaryKey" json:"id"`
+    OrderID   uint64  `gorm:"index;not null" json:"order_id"`
+    ProductID uint64  `gorm:"index;not null" json:"product_id"`
+    Quantity  int     `gorm:"not null" json:"quantity"`
+    Price     float64 `gorm:"type:decimal(10,2);not null" json:"price"`
+    
+    Product *Product `gorm:"foreignKey:ProductID" json:"product,omitempty"`
+}
+
+// ============ 商品模型 ============
+type Product struct {
+    BaseModel
+    Name        string  `gorm:"type:varchar(100);not null" json:"name"`
+    Description string  `gorm:"type:text" json:"description"`
+    Price       float64 `gorm:"type:decimal(10,2);not null" json:"price"`
+    Stock       int     `gorm:"default:0" json:"stock"`
+    CategoryID  uint64  `gorm:"index" json:"category_id"`
+    Status      int8    `gorm:"type:tinyint;default:1" json:"status"`
+    
+    Category *Category `gorm:"foreignKey:CategoryID" json:"category,omitempty"`
+}
+
+// ============ 分类模型（树形结构）============
+type Category struct {
+    ID       uint64     `gorm:"primaryKey" json:"id"`
+    Name     string     `gorm:"type:varchar(50);not null" json:"name"`
+    ParentID *uint64    `gorm:"index" json:"parent_id"`
+    Sort     int        `gorm:"default:0" json:"sort"`
+    
+    Parent   *Category  `gorm:"foreignKey:ParentID" json:"parent,omitempty"`
+    Children []Category `gorm:"foreignKey:ParentID" json:"children,omitempty"`
+}
+
+// ============ 角色模型（多对多）============
+type Role struct {
+    ID          uint64 `gorm:"primaryKey" json:"id"`
+    Name        string `gorm:"type:varchar(50);uniqueIndex;not null" json:"name"`
+    Description string `gorm:"type:varchar(255)" json:"description"`
+    
+    Users []User `gorm:"many2many:user_roles" json:"users,omitempty"`
+}
+
+// ============ 自动迁移 ============
+func AutoMigrate(db *gorm.DB) error {
+    return db.AutoMigrate(
+        &User{},
+        &UserProfile{},
+        &Order{},
+        &OrderItem{},
+        &Product{},
+        &Category{},
+        &Role{},
+    )
+}
+```
+
+### CRUD 操作
+
+```go
+package repository
+
+import (
+    "context"
+    "errors"
+
+    "gorm.io/gorm"
+    "gorm.io/gorm/clause"
+)
+
+// ============ 用户仓储 ============
+type UserRepository struct {
+    db *gorm.DB
+}
+
+func NewUserRepository(db *gorm.DB) *UserRepository {
+    return &UserRepository{db: db}
+}
+
+// Create 创建用户
+func (r *UserRepository) Create(ctx context.Context, user *User) error {
+    return r.db.WithContext(ctx).Create(user).Error
+}
+
+// BatchCreate 批量创建
+func (r *UserRepository) BatchCreate(ctx context.Context, users []*User) error {
+    return r.db.WithContext(ctx).CreateInBatches(users, 100).Error
+}
+
+// GetByID 根据 ID 查询
+func (r *UserRepository) GetByID(ctx context.Context, id uint64) (*User, error) {
+    var user User
+    err := r.db.WithContext(ctx).First(&user, id).Error
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return nil, nil
+    }
+    return &user, err
+}
+
+// GetByUsername 根据用户名查询
+func (r *UserRepository) GetByUsername(ctx context.Context, username string) (*User, error) {
+    var user User
+    err := r.db.WithContext(ctx).Where("username = ?", username).First(&user).Error
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return nil, nil
+    }
+    return &user, err
+}
+
+// GetWithProfile 查询用户及详情
+func (r *UserRepository) GetWithProfile(ctx context.Context, id uint64) (*User, error) {
+    var user User
+    err := r.db.WithContext(ctx).
+        Preload("Profile").
+        First(&user, id).Error
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return nil, nil
+    }
+    return &user, err
+}
+
+// GetWithRoles 查询用户及角色
+func (r *UserRepository) GetWithRoles(ctx context.Context, id uint64) (*User, error) {
+    var user User
+    err := r.db.WithContext(ctx).
+        Preload("Roles").
+        First(&user, id).Error
+    return &user, err
+}
+
+// List 分页查询
+func (r *UserRepository) List(ctx context.Context, page, pageSize int, conditions map[string]interface{}) ([]*User, int64, error) {
+    var users []*User
+    var total int64
+    
+    query := r.db.WithContext(ctx).Model(&User{})
+    
+    // 动态条件
+    if status, ok := conditions["status"]; ok {
+        query = query.Where("status = ?", status)
+    }
+    if keyword, ok := conditions["keyword"]; ok {
+        query = query.Where("username LIKE ? OR nickname LIKE ?", "%"+keyword.(string)+"%", "%"+keyword.(string)+"%")
+    }
+    
+    // 统计总数
+    if err := query.Count(&total).Error; err != nil {
+        return nil, 0, err
+    }
+    
+    // 分页查询
+    offset := (page - 1) * pageSize
+    err := query.
+        Order("id DESC").
+        Offset(offset).
+        Limit(pageSize).
+        Find(&users).Error
+    
+    return users, total, err
+}
+
+// Update 更新用户
+func (r *UserRepository) Update(ctx context.Context, id uint64, updates map[string]interface{}) error {
+    return r.db.WithContext(ctx).
+        Model(&User{}).
+        Where("id = ?", id).
+        Updates(updates).Error
+}
+
+// UpdateSelective 选择性更新（只更新非零值）
+func (r *UserRepository) UpdateSelective(ctx context.Context, user *User) error {
+    return r.db.WithContext(ctx).
+        Model(user).
+        Updates(user).Error
+}
+
+// Delete 删除用户（软删除）
+func (r *UserRepository) Delete(ctx context.Context, id uint64) error {
+    return r.db.WithContext(ctx).Delete(&User{}, id).Error
+}
+
+// HardDelete 硬删除
+func (r *UserRepository) HardDelete(ctx context.Context, id uint64) error {
+    return r.db.WithContext(ctx).Unscoped().Delete(&User{}, id).Error
+}
+
+// Exists 检查是否存在
+func (r *UserRepository) Exists(ctx context.Context, field string, value interface{}) (bool, error) {
+    var count int64
+    err := r.db.WithContext(ctx).
+        Model(&User{}).
+        Where(field+" = ?", value).
+        Count(&count).Error
+    return count > 0, err
+}
+```
+
+### 复杂查询
+
+```go
+package repository
+
+import (
+    "context"
+    "time"
+
+    "gorm.io/gorm"
+)
+
+// ============ 关联查询 ============
+
+// GetOrderWithDetails 获取订单详情（包含用户、商品信息）
+func (r *OrderRepository) GetOrderWithDetails(ctx context.Context, id uint64) (*Order, error) {
+    var order Order
+    err := r.db.WithContext(ctx).
+        Preload("User").
+        Preload("Items").
+        Preload("Items.Product").
+        First(&order, id).Error
+    return &order, err
+}
+
+// GetUserOrders 获取用户的订单列表
+func (r *OrderRepository) GetUserOrders(ctx context.Context, userID uint64, page, pageSize int) ([]*Order, error) {
+    var orders []*Order
+    err := r.db.WithContext(ctx).
+        Where("user_id = ?", userID).
+        Preload("Items", func(db *gorm.DB) *gorm.DB {
+            return db.Limit(5) // 每个订单只加载前 5 个商品
+        }).
+        Order("created_at DESC").
+        Offset((page - 1) * pageSize).
+        Limit(pageSize).
+        Find(&orders).Error
+    return orders, err
+}
+
+// ============ 聚合查询 ============
+
+type OrderStats struct {
+    TotalOrders  int64   `json:"total_orders"`
+    TotalAmount  float64 `json:"total_amount"`
+    AvgAmount    float64 `json:"avg_amount"`
+    PaidOrders   int64   `json:"paid_orders"`
+    UnpaidOrders int64   `json:"unpaid_orders"`
+}
+
+// GetUserOrderStats 获取用户订单统计
+func (r *OrderRepository) GetUserOrderStats(ctx context.Context, userID uint64) (*OrderStats, error) {
+    var stats OrderStats
+    err := r.db.WithContext(ctx).
+        Model(&Order{}).
+        Where("user_id = ?", userID).
+        Select(`
+            COUNT(*) as total_orders,
+            COALESCE(SUM(total_amount), 0) as total_amount,
+            COALESCE(AVG(total_amount), 0) as avg_amount,
+            SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as paid_orders,
+            SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END) as unpaid_orders
+        `).
+        Scan(&stats).Error
+    return &stats, err
+}
+
+// GetDailyOrderStats 按日统计订单
+func (r *OrderRepository) GetDailyOrderStats(ctx context.Context, startDate, endDate time.Time) ([]map[string]interface{}, error) {
+    var results []map[string]interface{}
+    err := r.db.WithContext(ctx).
+        Model(&Order{}).
+        Where("created_at BETWEEN ? AND ?", startDate, endDate).
+        Select(`
+            DATE(created_at) as date,
+            COUNT(*) as order_count,
+            SUM(total_amount) as total_amount
+        `).
+        Group("DATE(created_at)").
+        Order("date").
+        Find(&results).Error
+    return results, err
+}
+
+// ============ 子查询 ============
+
+// GetActiveUsers 获取有订单的活跃用户
+func (r *UserRepository) GetActiveUsers(ctx context.Context) ([]*User, error) {
+    var users []*User
+    
+    // 子查询：获取有订单的用户 ID
+    subQuery := r.db.Model(&Order{}).Select("DISTINCT user_id")
+    
+    err := r.db.WithContext(ctx).
+        Where("id IN (?)", subQuery).
+        Find(&users).Error
+    
+    return users, err
+}
+
+// GetTopBuyers 获取消费最高的用户
+func (r *UserRepository) GetTopBuyers(ctx context.Context, limit int) ([]map[string]interface{}, error) {
+    var results []map[string]interface{}
+    err := r.db.WithContext(ctx).
+        Table("users u").
+        Select("u.id, u.username, u.nickname, COALESCE(SUM(o.total_amount), 0) as total_spent").
+        Joins("LEFT JOIN orders o ON u.id = o.user_id AND o.deleted_at IS NULL").
+        Group("u.id").
+        Order("total_spent DESC").
+        Limit(limit).
+        Find(&results).Error
+    return results, err
+}
+
+// ============ 原生 SQL ============
+
+// ExecuteRawSQL 执行原生 SQL
+func (r *UserRepository) ExecuteRawSQL(ctx context.Context) error {
+    // 查询
+    var results []map[string]interface{}
+    r.db.WithContext(ctx).Raw(`
+        SELECT u.*, 
+               (SELECT COUNT(*) FROM orders WHERE user_id = u.id) as order_count
+        FROM users u
+        WHERE u.status = ?
+    `, 1).Scan(&results)
+    
+    // 执行
+    r.db.WithContext(ctx).Exec("UPDATE users SET status = ? WHERE last_login < ?", 0, time.Now().AddDate(0, -6, 0))
+    
+    return nil
+}
+
+// ============ 锁 ============
+
+// GetForUpdate 悲观锁查询
+func (r *ProductRepository) GetForUpdate(ctx context.Context, tx *gorm.DB, id uint64) (*Product, error) {
+    var product Product
+    err := tx.WithContext(ctx).
+        Clauses(clause.Locking{Strength: "UPDATE"}).
+        First(&product, id).Error
+    return &product, err
+}
+
+// DecrementStock 扣减库存（带锁）
+func (r *ProductRepository) DecrementStock(ctx context.Context, id uint64, quantity int) error {
+    return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        var product Product
+        // 加锁查询
+        if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+            First(&product, id).Error; err != nil {
+            return err
+        }
+        
+        // 检查库存
+        if product.Stock < quantity {
+            return errors.New("insufficient stock")
+        }
+        
+        // 扣减库存
+        return tx.Model(&product).
+            Update("stock", gorm.Expr("stock - ?", quantity)).Error
+    })
+}
+
+// OptimisticUpdate 乐观锁更新
+func (r *ProductRepository) OptimisticUpdate(ctx context.Context, product *Product) error {
+    result := r.db.WithContext(ctx).
+        Model(product).
+        Where("id = ? AND updated_at = ?", product.ID, product.UpdatedAt).
+        Updates(product)
+    
+    if result.RowsAffected == 0 {
+        return errors.New("concurrent update conflict")
+    }
+    return result.Error
+}
+```
+
+### 事务处理
+
+```go
+package service
+
+import (
+    "context"
+    "fmt"
+
+    "gorm.io/gorm"
+)
+
+// ============ 基本事务 ============
+
+func (s *OrderService) CreateOrder(ctx context.Context, req *CreateOrderRequest) (*Order, error) {
+    var order *Order
+    
+    err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        // 1. 创建订单
+        order = &Order{
+            OrderNo:     generateOrderNo(),
+            UserID:      req.UserID,
+            TotalAmount: req.TotalAmount,
+            Status:      0,
+        }
+        if err := tx.Create(order).Error; err != nil {
+            return err
+        }
+        
+        // 2. 创建订单项
+        for _, item := range req.Items {
+            orderItem := &OrderItem{
+                OrderID:   order.ID,
+                ProductID: item.ProductID,
+                Quantity:  item.Quantity,
+                Price:     item.Price,
+            }
+            if err := tx.Create(orderItem).Error; err != nil {
+                return err
+            }
+            
+            // 3. 扣减库存
+            result := tx.Model(&Product{}).
+                Where("id = ? AND stock >= ?", item.ProductID, item.Quantity).
+                Update("stock", gorm.Expr("stock - ?", item.Quantity))
+            
+            if result.RowsAffected == 0 {
+                return fmt.Errorf("product %d stock insufficient", item.ProductID)
+            }
+        }
+        
+        return nil
+    })
+    
+    if err != nil {
+        return nil, err
+    }
+    return order, nil
+}
+
+// ============ 嵌套事务（保存点）============
+
+func (s *OrderService) CreateOrderWithSavepoint(ctx context.Context, req *CreateOrderRequest) error {
+    return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        // 外层事务：创建订单
+        order := &Order{...}
+        if err := tx.Create(order).Error; err != nil {
+            return err
+        }
+        
+        // 嵌套事务：处理订单项
+        err := tx.Transaction(func(tx2 *gorm.DB) error {
+            for _, item := range req.Items {
+                // 这里的错误不会回滚外层事务
+                if err := tx2.Create(&OrderItem{...}).Error; err != nil {
+                    return err // 只回滚到这个保存点
+                }
+            }
+            return nil
+        })
+        
+        if err != nil {
+            // 可以选择继续或回滚
+            return err
+        }
+        
+        return nil
+    })
+}
+
+// ============ 手动事务控制 ============
+
+func (s *OrderService) ManualTransaction(ctx context.Context) error {
+    tx := s.db.WithContext(ctx).Begin()
+    if tx.Error != nil {
+        return tx.Error
+    }
+    
+    // 使用 defer 确保事务结束
+    defer func() {
+        if r := recover(); r != nil {
+            tx.Rollback()
+            panic(r)
+        }
+    }()
+    
+    // 执行操作
+    if err := tx.Create(&Order{...}).Error; err != nil {
+        tx.Rollback()
+        return err
+    }
+    
+    if err := tx.Create(&OrderItem{...}).Error; err != nil {
+        tx.Rollback()
+        return err
+    }
+    
+    return tx.Commit().Error
+}
+
+// ============ 事务传播 ============
+
+type TxKey struct{}
+
+// GetTxFromContext 从上下文获取事务
+func GetTxFromContext(ctx context.Context) *gorm.DB {
+    tx, ok := ctx.Value(TxKey{}).(*gorm.DB)
+    if ok {
+        return tx
+    }
+    return nil
+}
+
+// WithTx 在上下文中设置事务
+func WithTx(ctx context.Context, tx *gorm.DB) context.Context {
+    return context.WithValue(ctx, TxKey{}, tx)
+}
+
+// 使用事务上下文
+func (s *OrderService) CreateOrderWithTxContext(ctx context.Context, req *CreateOrderRequest) error {
+    return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        // 将事务放入上下文
+        txCtx := WithTx(ctx, tx)
+        
+        // 子服务使用相同事务
+        if err := s.orderRepo.Create(txCtx, &Order{...}); err != nil {
+            return err
+        }
+        
+        if err := s.stockService.Decrement(txCtx, req.Items); err != nil {
+            return err
+        }
+        
+        return nil
+    })
+}
+
+// 仓储层自动使用事务
+func (r *OrderRepository) Create(ctx context.Context, order *Order) error {
+    db := GetTxFromContext(ctx)
+    if db == nil {
+        db = r.db
+    }
+    return db.WithContext(ctx).Create(order).Error
+}
+```
+
+### 性能优化
+
+```go
+package db
+
+import (
+    "gorm.io/gorm"
+    "gorm.io/hints"
+)
+
+// ============ 索引优化 ============
+
+// 强制使用索引
+func (r *UserRepository) ListWithIndex(ctx context.Context) ([]*User, error) {
+    var users []*User
+    err := r.db.WithContext(ctx).
+        Clauses(hints.UseIndex("idx_status")).
+        Where("status = ?", 1).
+        Find(&users).Error
+    return users, err
+}
+
+// ============ 批量操作 ============
+
+// 批量插入
+func (r *UserRepository) BatchInsert(ctx context.Context, users []*User) error {
+    return r.db.WithContext(ctx).CreateInBatches(users, 100).Error
+}
+
+// 批量更新
+func (r *UserRepository) BatchUpdate(ctx context.Context, ids []uint64, updates map[string]interface{}) error {
+    return r.db.WithContext(ctx).
+        Model(&User{}).
+        Where("id IN ?", ids).
+        Updates(updates).Error
+}
+
+// 批量删除
+func (r *UserRepository) BatchDelete(ctx context.Context, ids []uint64) error {
+    return r.db.WithContext(ctx).Delete(&User{}, ids).Error
+}
+
+// ============ 分批处理大数据 ============
+
+func (r *UserRepository) ProcessInBatches(ctx context.Context, batchSize int, fn func([]*User) error) error {
+    return r.db.WithContext(ctx).
+        FindInBatches(&[]*User{}, batchSize, func(tx *gorm.DB, batch int) error {
+            users := tx.Statement.Dest.(*[]*User)
+            return fn(*users)
+        }).Error
+}
+
+// 使用游标分批处理
+func (r *UserRepository) ProcessWithCursor(ctx context.Context, fn func(*User) error) error {
+    rows, err := r.db.WithContext(ctx).Model(&User{}).Rows()
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        var user User
+        if err := r.db.ScanRows(rows, &user); err != nil {
+            return err
+        }
+        if err := fn(&user); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+// ============ 查询优化 ============
+
+// 只查询需要的字段
+func (r *UserRepository) ListBasicInfo(ctx context.Context) ([]map[string]interface{}, error) {
+    var results []map[string]interface{}
+    err := r.db.WithContext(ctx).
+        Model(&User{}).
+        Select("id", "username", "nickname", "avatar").
+        Find(&results).Error
+    return results, err
+}
+
+// 使用 Pluck 获取单列
+func (r *UserRepository) GetAllUsernames(ctx context.Context) ([]string, error) {
+    var usernames []string
+    err := r.db.WithContext(ctx).
+        Model(&User{}).
+        Pluck("username", &usernames).Error
+    return usernames, err
+}
+
+// 使用 Count 代替 Find
+func (r *UserRepository) CountByStatus(ctx context.Context, status int) (int64, error) {
+    var count int64
+    err := r.db.WithContext(ctx).
+        Model(&User{}).
+        Where("status = ?", status).
+        Count(&count).Error
+    return count, err
+}
+
+// ============ 预加载优化 ============
+
+// 条件预加载
+func (r *OrderRepository) GetWithConditionalPreload(ctx context.Context, id uint64) (*Order, error) {
+    var order Order
+    err := r.db.WithContext(ctx).
+        Preload("Items", "quantity > ?", 0).
+        Preload("Items.Product", func(db *gorm.DB) *gorm.DB {
+            return db.Select("id", "name", "price")
+        }).
+        First(&order, id).Error
+    return &order, err
+}
+
+// 使用 Joins 代替 Preload（单层关联）
+func (r *OrderRepository) GetWithJoins(ctx context.Context, id uint64) (*Order, error) {
+    var order Order
+    err := r.db.WithContext(ctx).
+        Joins("User").
+        First(&order, id).Error
+    return &order, err
+}
+```
+
+### 在 Hertz/Kitex 中集成
+
+```go
+// ============ Hertz Handler 集成 ============
+package handler
+
+import (
+    "context"
+
+    "github.com/cloudwego/hertz/pkg/app"
+    "github.com/cloudwego/hertz/pkg/protocol/consts"
+)
+
+type UserHandler struct {
+    userService *service.UserService
+}
+
+func NewUserHandler(userService *service.UserService) *UserHandler {
+    return &UserHandler{userService: userService}
+}
+
+func (h *UserHandler) GetUser(ctx context.Context, c *app.RequestContext) {
+    id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+    
+    user, err := h.userService.GetByID(ctx, id)
+    if err != nil {
+        c.JSON(consts.StatusInternalServerError, map[string]interface{}{
+            "error": err.Error(),
+        })
+        return
+    }
+    
+    if user == nil {
+        c.JSON(consts.StatusNotFound, map[string]interface{}{
+            "error": "user not found",
+        })
+        return
+    }
+    
+    c.JSON(consts.StatusOK, map[string]interface{}{
+        "code": 0,
+        "data": user,
+    })
+}
+
+func (h *UserHandler) ListUsers(ctx context.Context, c *app.RequestContext) {
+    var req ListUsersRequest
+    if err := c.BindAndValidate(&req); err != nil {
+        c.JSON(consts.StatusBadRequest, map[string]interface{}{
+            "error": err.Error(),
+        })
+        return
+    }
+    
+    users, total, err := h.userService.List(ctx, req.Page, req.PageSize, req.ToConditions())
+    if err != nil {
+        c.JSON(consts.StatusInternalServerError, map[string]interface{}{
+            "error": err.Error(),
+        })
+        return
+    }
+    
+    c.JSON(consts.StatusOK, map[string]interface{}{
+        "code": 0,
+        "data": map[string]interface{}{
+            "users": users,
+            "total": total,
+            "page":  req.Page,
+        },
+    })
+}
+
+// ============ Kitex Handler 集成 ============
+package main
+
+import (
+    "context"
+    
+    user "github.com/example/user-service/kitex_gen/user"
+)
+
+type UserServiceImpl struct {
+    userRepo *repository.UserRepository
+}
+
+func (s *UserServiceImpl) GetUser(ctx context.Context, req *user.GetUserRequest) (*user.GetUserResponse, error) {
+    u, err := s.userRepo.GetByID(ctx, uint64(req.Id))
+    if err != nil {
+        return nil, err
+    }
+    
+    if u == nil {
+        return &user.GetUserResponse{
+            Success: false,
+            Message: "user not found",
+        }, nil
+    }
+    
+    return &user.GetUserResponse{
+        Success: true,
+        User: &user.User{
+            Id:       int64(u.ID),
+            Username: u.Username,
+            Email:    u.Email,
+            Nickname: u.Nickname,
+        },
+    }, nil
+}
+
+func (s *UserServiceImpl) CreateUser(ctx context.Context, req *user.CreateUserRequest) (*user.CreateUserResponse, error) {
+    newUser := &model.User{
+        Username: req.Username,
+        Email:    req.Email,
+        Password: hashPassword(req.Password),
+        Nickname: req.Nickname,
+    }
+    
+    if err := s.userRepo.Create(ctx, newUser); err != nil {
+        return nil, err
+    }
+    
+    return &user.CreateUserResponse{
+        Success: true,
+        Message: "user created",
+        User: &user.User{
+            Id:       int64(newUser.ID),
+            Username: newUser.Username,
+        },
+    }, nil
+}
+
+// ============ 初始化数据库 ============
+package main
+
+import (
+    "log"
+    "time"
+
+    "github.com/cloudwego/hertz/pkg/app/server"
+    "gorm.io/gorm/logger"
+)
+
+func main() {
+    // 初始化数据库
+    dbConfig := &db.Config{
+        Host:         "localhost",
+        Port:         3306,
+        User:         "root",
+        Password:     "password",
+        DBName:       "myapp",
+        MaxIdleConns: 10,
+        MaxOpenConns: 100,
+        MaxLifetime:  time.Hour,
+        LogLevel:     logger.Info,
+    }
+    
+    if err := db.Init(dbConfig); err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+    
+    // 自动迁移
+    if err := model.AutoMigrate(db.DB); err != nil {
+        log.Fatal(err)
+    }
+    
+    // 初始化仓储和服务
+    userRepo := repository.NewUserRepository(db.DB)
+    userService := service.NewUserService(userRepo)
+    userHandler := handler.NewUserHandler(userService)
+    
+    // 启动 Hertz
+    h := server.Default(server.WithHostPorts(":8080"))
+    
+    api := h.Group("/api")
+    {
+        users := api.Group("/users")
+        users.GET("/:id", userHandler.GetUser)
+        users.GET("/", userHandler.ListUsers)
+        users.POST("/", userHandler.CreateUser)
+    }
+    
+    h.Spin()
+}
+```
+
+### GORM 最佳实践
+
+```go
+// ============ 1. 使用上下文传递数据库连接 ============
+type contextKey string
+
+const dbKey contextKey = "db"
+
+func DBMiddleware(db *gorm.DB) app.HandlerFunc {
+    return func(ctx context.Context, c *app.RequestContext) {
+        c.Set(string(dbKey), db)
+        c.Next(ctx)
+    }
+}
+
+func GetDB(c *app.RequestContext) *gorm.DB {
+    return c.MustGet(string(dbKey)).(*gorm.DB)
+}
+
+// ============ 2. 统一错误处理 ============
+func HandleDBError(err error) (int, string) {
+    if err == nil {
+        return 0, ""
+    }
+    
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return 404, "record not found"
+    }
+    
+    // MySQL 错误
+    var mysqlErr *mysql.MySQLError
+    if errors.As(err, &mysqlErr) {
+        switch mysqlErr.Number {
+        case 1062:
+            return 409, "duplicate entry"
+        case 1452:
+            return 400, "foreign key constraint fails"
+        }
+    }
+    
+    return 500, "database error"
+}
+
+// ============ 3. 软删除与恢复 ============
+func (r *UserRepository) Restore(ctx context.Context, id uint64) error {
+    return r.db.WithContext(ctx).
+        Unscoped().
+        Model(&User{}).
+        Where("id = ?", id).
+        Update("deleted_at", nil).Error
+}
+
+// 查询包含已删除记录
+func (r *UserRepository) GetAllIncludingDeleted(ctx context.Context) ([]*User, error) {
+    var users []*User
+    err := r.db.WithContext(ctx).Unscoped().Find(&users).Error
+    return users, err
+}
+
+// ============ 4. 审计日志 ============
+type AuditLog struct {
+    ID        uint64    `gorm:"primaryKey"`
+    TableName string    `gorm:"type:varchar(50)"`
+    RecordID  uint64
+    Action    string    `gorm:"type:varchar(20)"` // create, update, delete
+    OldValue  string    `gorm:"type:text"`
+    NewValue  string    `gorm:"type:text"`
+    UserID    uint64
+    CreatedAt time.Time
+}
+
+func RegisterAuditCallbacks(db *gorm.DB) {
+    db.Callback().Create().After("gorm:create").Register("audit:create", auditCreate)
+    db.Callback().Update().After("gorm:update").Register("audit:update", auditUpdate)
+    db.Callback().Delete().After("gorm:delete").Register("audit:delete", auditDelete)
+}
+
+// ============ 5. 通用仓储 ============
+type Repository[T any] struct {
+    db *gorm.DB
+}
+
+func NewRepository[T any](db *gorm.DB) *Repository[T] {
+    return &Repository[T]{db: db}
+}
+
+func (r *Repository[T]) Create(ctx context.Context, entity *T) error {
+    return r.db.WithContext(ctx).Create(entity).Error
+}
+
+func (r *Repository[T]) GetByID(ctx context.Context, id uint64) (*T, error) {
+    var entity T
+    err := r.db.WithContext(ctx).First(&entity, id).Error
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return nil, nil
+    }
+    return &entity, err
+}
+
+func (r *Repository[T]) Update(ctx context.Context, id uint64, updates map[string]interface{}) error {
+    var entity T
+    return r.db.WithContext(ctx).Model(&entity).Where("id = ?", id).Updates(updates).Error
+}
+
+func (r *Repository[T]) Delete(ctx context.Context, id uint64) error {
+    var entity T
+    return r.db.WithContext(ctx).Delete(&entity, id).Error
+}
+
+func (r *Repository[T]) List(ctx context.Context, page, pageSize int) ([]*T, int64, error) {
+    var entities []*T
+    var total int64
+    var entity T
+    
+    r.db.WithContext(ctx).Model(&entity).Count(&total)
+    err := r.db.WithContext(ctx).
+        Offset((page - 1) * pageSize).
+        Limit(pageSize).
+        Find(&entities).Error
+    
+    return entities, total, err
+}
+
+// 使用
+userRepo := NewRepository[User](db)
+user, _ := userRepo.GetByID(ctx, 1)
 ```
 
 ---
