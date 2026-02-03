@@ -8,14 +8,15 @@
 2. [Hertz 快速开始](#hertz-快速开始)
 3. [Hertz 路由与中间件](#hertz-路由与中间件)
 4. [Hertz 请求处理](#hertz-请求处理)
-5. [Hertz 高级特性](#hertz-高级特性)
-6. [Kitex 快速开始](#kitex-快速开始)
-7. [Kitex IDL 与代码生成](#kitex-idl-与代码生成)
-8. [Kitex 服务端开发](#kitex-服务端开发)
-9. [Kitex 客户端开发](#kitex-客户端开发)
-10. [Kitex 高级特性](#kitex-高级特性)
-11. [Hertz + Kitex 微服务实战](#hertz--kitex-微服务实战)
-12. [性能优化与最佳实践](#性能优化与最佳实践)
+5. [参数校验详解](#参数校验详解)
+6. [Hertz 高级特性](#hertz-高级特性)
+7. [Kitex 快速开始](#kitex-快速开始)
+8. [Kitex IDL 与代码生成](#kitex-idl-与代码生成)
+9. [Kitex 服务端开发](#kitex-服务端开发)
+10. [Kitex 客户端开发](#kitex-客户端开发)
+11. [Kitex 高级特性](#kitex-高级特性)
+12. [Hertz + Kitex 微服务实战](#hertz--kitex-微服务实战)
+13. [性能优化与最佳实践](#性能优化与最佳实践)
 
 ---
 
@@ -731,47 +732,1019 @@ func CreateUser(ctx context.Context, c *app.RequestContext) {
         "message": "User created",
     })
 }
+```
 
-// ============ 验证标签说明 ============
-/*
-vd 验证标签语法：
+---
 
-比较运算符：
-  $>0, $>=0, $<100, $<=100, $==0, $!=0
+## 参数校验详解
 
-长度验证：
-  len($)>0          - 字符串/数组长度大于 0
-  len($)>=6         - 长度至少 6
-  len($)<=20        - 长度最多 20
+本节详细介绍 Hertz 和 Kitex 中的参数校验机制，包括内置验证器、自定义验证规则、错误处理等。
 
-正则验证：
-  regexp('pattern') - 正则匹配
+### Hertz 参数校验
 
-枚举验证：
-  in($, 'a', 'b')   - 值在枚举中
+#### vd 验证器基础
 
-邮箱验证：
-  email($)          - 邮箱格式
+Hertz 使用 `go-tagexpr/v2` 作为默认验证器，通过 `vd` 标签定义验证规则。
 
-组合验证：
-  $>0 && $<100      - AND 组合
-  $==0 || $>10      - OR 组合
+```go
+import (
+    "github.com/cloudwego/hertz/pkg/app/server/binding"
+)
 
-自定义消息：
-  ; msg:'错误消息'  - 自定义错误消息
+// ============ vd 标签完整语法 ============
 
-嵌套验证：
-  dive              - 验证数组/切片中的每个元素
-*/
+type UserRequest struct {
+    // 必填验证
+    Name string `json:"name" vd:"len($)>0; msg:'姓名不能为空'"`
+    
+    // 数值范围
+    Age    int     `json:"age" vd:"$>=0 && $<=150; msg:'年龄必须在 0-150 之间'"`
+    Score  float64 `json:"score" vd:"$>=0.0 && $<=100.0; msg:'分数范围 0-100'"`
+    Amount int64   `json:"amount" vd:"$>0; msg:'金额必须大于 0'"`
+    
+    // 字符串长度
+    Username string `json:"username" vd:"len($)>=3 && len($)<=20; msg:'用户名长度 3-20'"`
+    Bio      string `json:"bio" vd:"len($)<=500; msg:'简介最多 500 字符'"`
+    
+    // 正则匹配
+    Phone    string `json:"phone" vd:"regexp('^1[3-9]\\d{9}$'); msg:'手机号格式错误'"`
+    IDCard   string `json:"id_card" vd:"regexp('^\\d{17}[\\dXx]$'); msg:'身份证格式错误'"`
+    PostCode string `json:"post_code" vd:"regexp('^\\d{6}$'); msg:'邮编格式错误'"`
+    
+    // 内置函数
+    Email    string `json:"email" vd:"email($); msg:'邮箱格式错误'"`
+    
+    // 枚举值
+    Gender string `json:"gender" vd:"in($, 'male', 'female', 'other'); msg:'性别值无效'"`
+    Status int    `json:"status" vd:"in($, 0, 1, 2); msg:'状态值必须是 0/1/2'"`
+    
+    // 可选字段（允许零值）
+    Nickname string `json:"nickname" vd:"len($)==0 || (len($)>=2 && len($)<=30); msg:'昵称长度 2-30'"`
+    
+    // 条件验证
+    Password        string `json:"password" vd:"len($)>=8; msg:'密码至少 8 位'"`
+    ConfirmPassword string `json:"confirm_password" vd:"$==Password; msg:'两次密码不一致'"`
+}
+```
 
-type OrderRequest struct {
-    UserID uint   `json:"user_id" vd:"$>0"`
-    Items  []Item `json:"items" vd:"len($)>0; dive"`  // dive 验证每个元素
+#### vd 验证器运算符
+
+```go
+// ============ 比较运算符 ============
+type CompareExample struct {
+    A int `vd:"$>0"`           // 大于
+    B int `vd:"$>=0"`          // 大于等于
+    C int `vd:"$<100"`         // 小于
+    D int `vd:"$<=100"`        // 小于等于
+    E int `vd:"$==10"`         // 等于
+    F int `vd:"$!=0"`          // 不等于
 }
 
-type Item struct {
-    ProductID uint `json:"product_id" vd:"$>0"`
-    Quantity  int  `json:"quantity" vd:"$>0 && $<=100"`
+// ============ 逻辑运算符 ============
+type LogicExample struct {
+    // AND：两个条件都满足
+    Age int `vd:"$>=18 && $<=60; msg:'年龄必须在 18-60 之间'"`
+    
+    // OR：满足任一条件
+    Type string `vd:"$=='vip' || $=='normal'; msg:'类型无效'"`
+    
+    // NOT：取反
+    Status int `vd:"!($==0); msg:'状态不能为 0'"`
+    
+    // 复合条件
+    Level int `vd:"($>=1 && $<=10) || $==99; msg:'等级 1-10 或 99'"`
+}
+
+// ============ 内置函数 ============
+type FunctionExample struct {
+    // len() - 长度
+    Name  string   `vd:"len($)>0"`
+    Items []string `vd:"len($)>0 && len($)<=10"`
+    
+    // email() - 邮箱格式
+    Email string `vd:"email($)"`
+    
+    // regexp() - 正则匹配
+    Phone string `vd:"regexp('^1\\d{10}$')"`
+    
+    // in() - 枚举
+    Type string `vd:"in($, 'a', 'b', 'c')"`
+    
+    // sprintf() - 格式化消息
+    Code string `vd:"len($)==6; msg:sprintf('验证码长度必须为 6，当前长度 %d', len($))"`
+}
+```
+
+#### 嵌套结构与数组验证
+
+```go
+// ============ 嵌套结构验证 ============
+type Order struct {
+    OrderNo string `json:"order_no" vd:"len($)>0; msg:'订单号不能为空'"`
+    
+    // 嵌套结构自动验证
+    User    UserInfo `json:"user"`
+    Address Address  `json:"address"`
+    
+    // 数组/切片验证
+    Items []OrderItem `json:"items" vd:"len($)>0 && len($)<=100; msg:'商品数量 1-100'"`
+}
+
+type UserInfo struct {
+    ID   int64  `json:"id" vd:"$>0; msg:'用户ID无效'"`
+    Name string `json:"name" vd:"len($)>0; msg:'用户名不能为空'"`
+}
+
+type Address struct {
+    Province string `json:"province" vd:"len($)>0; msg:'省份不能为空'"`
+    City     string `json:"city" vd:"len($)>0; msg:'城市不能为空'"`
+    Detail   string `json:"detail" vd:"len($)>=5 && len($)<=200; msg:'详细地址 5-200 字符'"`
+}
+
+type OrderItem struct {
+    ProductID int64   `json:"product_id" vd:"$>0; msg:'商品ID无效'"`
+    Quantity  int     `json:"quantity" vd:"$>0 && $<=999; msg:'数量 1-999'"`
+    Price     float64 `json:"price" vd:"$>0; msg:'价格必须大于 0'"`
+}
+
+// ============ Map 验证 ============
+type ConfigRequest struct {
+    // Map 键值验证
+    Settings map[string]string `json:"settings" vd:"len($)>0 && len($)<=50; msg:'配置项 1-50 个'"`
+    
+    // 复杂 Map
+    Metadata map[string]interface{} `json:"metadata"`
+}
+
+// ============ 指针字段验证 ============
+type UpdateRequest struct {
+    // 指针字段：nil 时跳过验证，非 nil 时验证
+    Name  *string `json:"name" vd:"@:len($)>=2; msg:'姓名至少 2 字符'"`
+    Age   *int    `json:"age" vd:"@:$>=0 && $<=150; msg:'年龄 0-150'"`
+    Email *string `json:"email" vd:"@:email($); msg:'邮箱格式错误'"`
+}
+// 注意：@: 前缀表示仅当字段非 nil 时才验证
+```
+
+#### 自定义验证函数
+
+```go
+package validator
+
+import (
+    "reflect"
+    "regexp"
+    "unicode"
+    
+    "github.com/bytedance/go-tagexpr/v2/validator"
+)
+
+// ============ 注册自定义验证函数 ============
+func init() {
+    // 注册自定义函数
+    validator.RegFunc("mobile", validateMobile)
+    validator.RegFunc("idcard", validateIDCard)
+    validator.RegFunc("password_strength", validatePasswordStrength)
+    validator.RegFunc("chinese", validateChinese)
+    validator.RegFunc("url", validateURL)
+    validator.RegFunc("ip", validateIP)
+}
+
+// 手机号验证
+func validateMobile(args ...interface{}) error {
+    if len(args) != 1 {
+        return fmt.Errorf("mobile() requires 1 argument")
+    }
+    
+    phone, ok := args[0].(string)
+    if !ok {
+        return fmt.Errorf("mobile() argument must be string")
+    }
+    
+    if phone == "" {
+        return nil // 允许空值，必填用 len($)>0
+    }
+    
+    matched, _ := regexp.MatchString(`^1[3-9]\d{9}$`, phone)
+    if !matched {
+        return fmt.Errorf("invalid mobile number")
+    }
+    return nil
+}
+
+// 身份证验证（含校验位）
+func validateIDCard(args ...interface{}) error {
+    if len(args) != 1 {
+        return fmt.Errorf("idcard() requires 1 argument")
+    }
+    
+    idcard, ok := args[0].(string)
+    if !ok {
+        return fmt.Errorf("idcard() argument must be string")
+    }
+    
+    if idcard == "" {
+        return nil
+    }
+    
+    // 18 位身份证校验
+    if len(idcard) != 18 {
+        return fmt.Errorf("ID card must be 18 digits")
+    }
+    
+    // 校验位计算
+    weights := []int{7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2}
+    checkCodes := "10X98765432"
+    
+    sum := 0
+    for i := 0; i < 17; i++ {
+        n := int(idcard[i] - '0')
+        if n < 0 || n > 9 {
+            return fmt.Errorf("invalid ID card format")
+        }
+        sum += n * weights[i]
+    }
+    
+    checkCode := checkCodes[sum%11]
+    if idcard[17] != byte(checkCode) && !(checkCode == 'X' && (idcard[17] == 'x' || idcard[17] == 'X')) {
+        return fmt.Errorf("invalid ID card check digit")
+    }
+    
+    return nil
+}
+
+// 密码强度验证
+func validatePasswordStrength(args ...interface{}) error {
+    if len(args) != 1 {
+        return fmt.Errorf("password_strength() requires 1 argument")
+    }
+    
+    password, ok := args[0].(string)
+    if !ok {
+        return fmt.Errorf("password_strength() argument must be string")
+    }
+    
+    if len(password) < 8 {
+        return fmt.Errorf("password must be at least 8 characters")
+    }
+    
+    var hasUpper, hasLower, hasNumber, hasSpecial bool
+    for _, c := range password {
+        switch {
+        case unicode.IsUpper(c):
+            hasUpper = true
+        case unicode.IsLower(c):
+            hasLower = true
+        case unicode.IsNumber(c):
+            hasNumber = true
+        case unicode.IsPunct(c) || unicode.IsSymbol(c):
+            hasSpecial = true
+        }
+    }
+    
+    strength := 0
+    if hasUpper {
+        strength++
+    }
+    if hasLower {
+        strength++
+    }
+    if hasNumber {
+        strength++
+    }
+    if hasSpecial {
+        strength++
+    }
+    
+    if strength < 3 {
+        return fmt.Errorf("password must contain at least 3 of: uppercase, lowercase, number, special character")
+    }
+    
+    return nil
+}
+
+// 中文字符验证
+func validateChinese(args ...interface{}) error {
+    if len(args) != 1 {
+        return fmt.Errorf("chinese() requires 1 argument")
+    }
+    
+    str, ok := args[0].(string)
+    if !ok {
+        return fmt.Errorf("chinese() argument must be string")
+    }
+    
+    for _, r := range str {
+        if !unicode.Is(unicode.Han, r) {
+            return fmt.Errorf("must be Chinese characters only")
+        }
+    }
+    
+    return nil
+}
+
+// ============ 使用自定义验证函数 ============
+type RegisterRequest struct {
+    Phone    string `json:"phone" vd:"mobile($); msg:'手机号格式错误'"`
+    IDCard   string `json:"id_card" vd:"idcard($); msg:'身份证号无效'"`
+    Password string `json:"password" vd:"password_strength($); msg:'密码强度不够'"`
+    RealName string `json:"real_name" vd:"chinese($) && len($)>=2 && len($)<=10; msg:'请输入 2-10 个汉字'"`
+}
+```
+
+#### 参数绑定与验证方法
+
+```go
+package handler
+
+import (
+    "context"
+
+    "github.com/cloudwego/hertz/pkg/app"
+    "github.com/cloudwego/hertz/pkg/protocol/consts"
+)
+
+// ============ 绑定方法对比 ============
+
+func BindingExamples(ctx context.Context, c *app.RequestContext) {
+    var req UserRequest
+    
+    // 方法 1: Bind - 只绑定，不验证
+    err := c.Bind(&req)
+    
+    // 方法 2: Validate - 只验证，不绑定
+    err = c.Validate(&req)
+    
+    // 方法 3: BindAndValidate - 绑定 + 验证（推荐）
+    err = c.BindAndValidate(&req)
+    
+    // 方法 4: BindQuery - 只绑定查询参数
+    err = c.BindQuery(&req)
+    
+    // 方法 5: BindForm - 只绑定表单参数
+    err = c.BindForm(&req)
+    
+    // 方法 6: BindJSON - 只绑定 JSON Body
+    err = c.BindJSON(&req)
+    
+    // 方法 7: BindPath - 只绑定路径参数
+    err = c.BindPath(&req)
+    
+    // 方法 8: BindHeader - 只绑定请求头
+    err = c.BindHeader(&req)
+}
+
+// ============ 混合参数绑定 ============
+
+type QueryParams struct {
+    Page     int    `query:"page" vd:"$>=1; msg:'页码从 1 开始'"`
+    PageSize int    `query:"page_size" vd:"$>=1 && $<=100; msg:'每页 1-100 条'"`
+    Keyword  string `query:"keyword"`
+}
+
+type PathParams struct {
+    ID int64 `path:"id" vd:"$>0; msg:'ID 无效'"`
+}
+
+type HeaderParams struct {
+    Authorization string `header:"Authorization" vd:"len($)>0; msg:'缺少认证信息'"`
+    UserAgent     string `header:"User-Agent"`
+}
+
+type BodyParams struct {
+    Name  string `json:"name" vd:"len($)>0; msg:'名称不能为空'"`
+    Email string `json:"email" vd:"email($); msg:'邮箱格式错误'"`
+}
+
+// 组合请求结构
+type ComplexRequest struct {
+    QueryParams
+    PathParams
+    HeaderParams
+    BodyParams
+}
+
+func HandleComplexRequest(ctx context.Context, c *app.RequestContext) {
+    var req ComplexRequest
+    
+    // 一次性绑定所有参数
+    if err := c.BindAndValidate(&req); err != nil {
+        c.JSON(consts.StatusBadRequest, map[string]interface{}{
+            "error": err.Error(),
+        })
+        return
+    }
+    
+    // req.Page, req.ID, req.Authorization, req.Name 都已填充
+}
+```
+
+#### 验证错误处理
+
+```go
+package handler
+
+import (
+    "context"
+    "errors"
+    "strings"
+
+    "github.com/bytedance/go-tagexpr/v2/validator"
+    "github.com/cloudwego/hertz/pkg/app"
+    "github.com/cloudwego/hertz/pkg/protocol/consts"
+)
+
+// ============ 错误响应结构 ============
+type ValidationError struct {
+    Field   string `json:"field"`
+    Message string `json:"message"`
+}
+
+type ErrorResponse struct {
+    Code    int               `json:"code"`
+    Message string            `json:"message"`
+    Errors  []ValidationError `json:"errors,omitempty"`
+}
+
+// ============ 解析验证错误 ============
+func ParseValidationError(err error) []ValidationError {
+    if err == nil {
+        return nil
+    }
+    
+    var validationErrors []ValidationError
+    
+    // go-tagexpr 验证错误格式: "field_name: error message"
+    errStr := err.Error()
+    parts := strings.Split(errStr, "; ")
+    
+    for _, part := range parts {
+        idx := strings.Index(part, ": ")
+        if idx > 0 {
+            validationErrors = append(validationErrors, ValidationError{
+                Field:   part[:idx],
+                Message: part[idx+2:],
+            })
+        } else {
+            validationErrors = append(validationErrors, ValidationError{
+                Message: part,
+            })
+        }
+    }
+    
+    return validationErrors
+}
+
+// ============ 统一验证处理 ============
+func ValidateRequest(c *app.RequestContext, req interface{}) bool {
+    if err := c.BindAndValidate(req); err != nil {
+        errors := ParseValidationError(err)
+        c.JSON(consts.StatusBadRequest, ErrorResponse{
+            Code:    400,
+            Message: "参数验证失败",
+            Errors:  errors,
+        })
+        return false
+    }
+    return true
+}
+
+// 使用示例
+func CreateUser(ctx context.Context, c *app.RequestContext) {
+    var req CreateUserRequest
+    
+    if !ValidateRequest(c, &req) {
+        return
+    }
+    
+    // 业务逻辑...
+}
+
+// ============ 自定义验证错误处理器 ============
+func SetupValidation() {
+    // 自定义绑定错误处理
+    binding.SetLooseZeroMode(true) // 允许零值
+    
+    // 配置验证器
+    vd := binding.NewValidator()
+    vd.SetErrorFactory(func(failPath, msg string) error {
+        return fmt.Errorf("字段 '%s' 验证失败: %s", failPath, msg)
+    })
+}
+```
+
+### Kitex 参数校验
+
+#### IDL 级别验证
+
+```thrift
+// idl/user.thrift
+namespace go user
+
+// ============ 使用 api 注解定义验证规则 ============
+struct CreateUserRequest {
+    1: string name (
+        api.body = "name",
+        api.vd = "len($)>0 && len($)<=50; msg:'姓名 1-50 字符'"
+    )
+    
+    2: string email (
+        api.body = "email",
+        api.vd = "email($); msg:'邮箱格式错误'"
+    )
+    
+    3: i32 age (
+        api.body = "age",
+        api.vd = "$>=0 && $<=150; msg:'年龄 0-150'"
+    )
+    
+    4: string phone (
+        api.body = "phone",
+        api.vd = "regexp('^1[3-9]\\d{9}$'); msg:'手机号格式错误'"
+    )
+    
+    5: string status (
+        api.body = "status",
+        api.vd = "in($, 'active', 'inactive', 'pending'); msg:'状态值无效'"
+    )
+    
+    6: optional string avatar (
+        api.body = "avatar",
+        api.vd = "@:len($)<=500; msg:'头像 URL 最长 500 字符'"
+    )
+}
+
+// 嵌套结构验证
+struct Address {
+    1: string province (api.body = "province", api.vd = "len($)>0")
+    2: string city (api.body = "city", api.vd = "len($)>0")
+    3: string detail (api.body = "detail", api.vd = "len($)>=5 && len($)<=200")
+}
+
+struct CreateOrderRequest {
+    1: i64 user_id (api.body = "user_id", api.vd = "$>0")
+    2: Address address (api.body = "address")
+    3: list<OrderItem> items (api.body = "items", api.vd = "len($)>0 && len($)<=100")
+    4: double total_amount (api.body = "total_amount", api.vd = "$>0")
+}
+
+struct OrderItem {
+    1: i64 product_id (api.body = "product_id", api.vd = "$>0")
+    2: i32 quantity (api.body = "quantity", api.vd = "$>0 && $<=999")
+    3: double price (api.body = "price", api.vd = "$>0")
+}
+```
+
+#### Handler 级别验证
+
+```go
+// handler.go
+package main
+
+import (
+    "context"
+    "fmt"
+    "regexp"
+
+    user "github.com/example/user-service/kitex_gen/user"
+)
+
+// ============ 业务验证器 ============
+type UserValidator struct{}
+
+func (v *UserValidator) ValidateCreateUser(req *user.CreateUserRequest) error {
+    // 必填验证
+    if req.Name == "" {
+        return fmt.Errorf("name is required")
+    }
+    
+    // 长度验证
+    if len(req.Name) > 50 {
+        return fmt.Errorf("name must be less than 50 characters")
+    }
+    
+    // 邮箱格式
+    if !isValidEmail(req.Email) {
+        return fmt.Errorf("invalid email format")
+    }
+    
+    // 手机号格式
+    if req.Phone != "" && !isValidPhone(req.Phone) {
+        return fmt.Errorf("invalid phone number")
+    }
+    
+    // 年龄范围
+    if req.Age < 0 || req.Age > 150 {
+        return fmt.Errorf("age must be between 0 and 150")
+    }
+    
+    // 枚举验证
+    validStatus := map[string]bool{"active": true, "inactive": true, "pending": true}
+    if !validStatus[req.Status] {
+        return fmt.Errorf("invalid status")
+    }
+    
+    return nil
+}
+
+func isValidEmail(email string) bool {
+    pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+    matched, _ := regexp.MatchString(pattern, email)
+    return matched
+}
+
+func isValidPhone(phone string) bool {
+    pattern := `^1[3-9]\d{9}$`
+    matched, _ := regexp.MatchString(pattern, phone)
+    return matched
+}
+
+// ============ 在 Handler 中使用 ============
+type UserServiceImpl struct {
+    validator *UserValidator
+}
+
+func NewUserServiceImpl() *UserServiceImpl {
+    return &UserServiceImpl{
+        validator: &UserValidator{},
+    }
+}
+
+func (s *UserServiceImpl) CreateUser(ctx context.Context, req *user.CreateUserRequest) (*user.CreateUserResponse, error) {
+    // 参数验证
+    if err := s.validator.ValidateCreateUser(req); err != nil {
+        return &user.CreateUserResponse{
+            Success: false,
+            Message: err.Error(),
+        }, nil
+    }
+    
+    // 业务逻辑...
+    return &user.CreateUserResponse{
+        Success: true,
+        Message: "User created successfully",
+    }, nil
+}
+```
+
+#### 使用 validator 库
+
+```go
+package validator
+
+import (
+    "github.com/go-playground/validator/v10"
+)
+
+var validate *validator.Validate
+
+func init() {
+    validate = validator.New()
+    
+    // 注册自定义验证器
+    validate.RegisterValidation("mobile", validateMobile)
+    validate.RegisterValidation("idcard", validateIDCard)
+}
+
+// 自定义手机号验证
+func validateMobile(fl validator.FieldLevel) bool {
+    phone := fl.Field().String()
+    if phone == "" {
+        return true // 空值由 required 处理
+    }
+    matched, _ := regexp.MatchString(`^1[3-9]\d{9}$`, phone)
+    return matched
+}
+
+// 自定义身份证验证
+func validateIDCard(fl validator.FieldLevel) bool {
+    idcard := fl.Field().String()
+    if idcard == "" {
+        return true
+    }
+    // 校验逻辑...
+    return len(idcard) == 18
+}
+
+// ============ 验证请求结构 ============
+type CreateUserReq struct {
+    Name     string `validate:"required,min=1,max=50"`
+    Email    string `validate:"required,email"`
+    Age      int    `validate:"gte=0,lte=150"`
+    Phone    string `validate:"omitempty,mobile"`
+    Password string `validate:"required,min=8,max=32"`
+    Status   string `validate:"required,oneof=active inactive pending"`
+}
+
+func ValidateCreateUserReq(req *CreateUserReq) error {
+    return validate.Struct(req)
+}
+
+// ============ 翻译验证错误 ============
+import (
+    "github.com/go-playground/locales/zh"
+    ut "github.com/go-playground/universal-translator"
+    zh_translations "github.com/go-playground/validator/v10/translations/zh"
+)
+
+var (
+    uni      *ut.UniversalTranslator
+    trans    ut.Translator
+)
+
+func InitTranslator() {
+    zhLocale := zh.New()
+    uni = ut.New(zhLocale, zhLocale)
+    trans, _ = uni.GetTranslator("zh")
+    
+    zh_translations.RegisterDefaultTranslations(validate, trans)
+    
+    // 自定义翻译
+    validate.RegisterTranslation("mobile", trans, func(ut ut.Translator) error {
+        return ut.Add("mobile", "{0}必须是有效的手机号", true)
+    }, func(ut ut.Translator, fe validator.FieldError) string {
+        t, _ := ut.T("mobile", fe.Field())
+        return t
+    })
+}
+
+func TranslateError(err error) string {
+    if err == nil {
+        return ""
+    }
+    
+    errs, ok := err.(validator.ValidationErrors)
+    if !ok {
+        return err.Error()
+    }
+    
+    var messages []string
+    for _, e := range errs {
+        messages = append(messages, e.Translate(trans))
+    }
+    return strings.Join(messages, "; ")
+}
+```
+
+### 通用校验模式
+
+#### 校验中间件
+
+```go
+// Hertz 验证中间件
+package middleware
+
+import (
+    "context"
+
+    "github.com/cloudwego/hertz/pkg/app"
+    "github.com/cloudwego/hertz/pkg/protocol/consts"
+)
+
+// 通用验证中间件
+func ValidateMiddleware[T any]() app.HandlerFunc {
+    return func(ctx context.Context, c *app.RequestContext) {
+        var req T
+        if err := c.BindAndValidate(&req); err != nil {
+            c.JSON(consts.StatusBadRequest, map[string]interface{}{
+                "code":    400,
+                "message": "参数验证失败",
+                "error":   err.Error(),
+            })
+            c.Abort()
+            return
+        }
+        
+        // 存入上下文
+        c.Set("validated_request", &req)
+        c.Next(ctx)
+    }
+}
+
+// 使用示例
+func main() {
+    h := server.Default()
+    
+    h.POST("/users", ValidateMiddleware[CreateUserRequest](), createUserHandler)
+}
+
+func createUserHandler(ctx context.Context, c *app.RequestContext) {
+    req := c.MustGet("validated_request").(*CreateUserRequest)
+    // 使用已验证的 req
+}
+```
+
+#### 业务规则验证
+
+```go
+// 业务规则验证器
+package validator
+
+import (
+    "context"
+    "fmt"
+)
+
+// 验证规则接口
+type Rule interface {
+    Validate(ctx context.Context) error
+}
+
+// 规则链
+type RuleChain struct {
+    rules []Rule
+}
+
+func NewRuleChain(rules ...Rule) *RuleChain {
+    return &RuleChain{rules: rules}
+}
+
+func (c *RuleChain) Validate(ctx context.Context) error {
+    for _, rule := range c.rules {
+        if err := rule.Validate(ctx); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+// ============ 具体业务规则 ============
+
+// 用户名唯一性验证
+type UniqueUsernameRule struct {
+    Username string
+    UserRepo UserRepository
+}
+
+func (r *UniqueUsernameRule) Validate(ctx context.Context) error {
+    exists, err := r.UserRepo.ExistsByUsername(ctx, r.Username)
+    if err != nil {
+        return fmt.Errorf("failed to check username: %w", err)
+    }
+    if exists {
+        return fmt.Errorf("username '%s' already exists", r.Username)
+    }
+    return nil
+}
+
+// 邮箱唯一性验证
+type UniqueEmailRule struct {
+    Email    string
+    UserRepo UserRepository
+}
+
+func (r *UniqueEmailRule) Validate(ctx context.Context) error {
+    exists, err := r.UserRepo.ExistsByEmail(ctx, r.Email)
+    if err != nil {
+        return fmt.Errorf("failed to check email: %w", err)
+    }
+    if exists {
+        return fmt.Errorf("email '%s' already registered", r.Email)
+    }
+    return nil
+}
+
+// 库存检查规则
+type StockAvailableRule struct {
+    ProductID int64
+    Quantity  int
+    StockRepo StockRepository
+}
+
+func (r *StockAvailableRule) Validate(ctx context.Context) error {
+    stock, err := r.StockRepo.GetStock(ctx, r.ProductID)
+    if err != nil {
+        return fmt.Errorf("failed to check stock: %w", err)
+    }
+    if stock < r.Quantity {
+        return fmt.Errorf("insufficient stock: available %d, requested %d", stock, r.Quantity)
+    }
+    return nil
+}
+
+// ============ 在 Handler 中使用 ============
+func (s *UserServiceImpl) CreateUser(ctx context.Context, req *CreateUserRequest) (*CreateUserResponse, error) {
+    // 1. 基础参数验证（由框架完成）
+    
+    // 2. 业务规则验证
+    rules := NewRuleChain(
+        &UniqueUsernameRule{Username: req.Username, UserRepo: s.userRepo},
+        &UniqueEmailRule{Email: req.Email, UserRepo: s.userRepo},
+    )
+    
+    if err := rules.Validate(ctx); err != nil {
+        return &CreateUserResponse{
+            Success: false,
+            Message: err.Error(),
+        }, nil
+    }
+    
+    // 3. 执行业务逻辑
+    user, err := s.userRepo.Create(ctx, req)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &CreateUserResponse{
+        Success: true,
+        Message: "User created",
+        User:    user,
+    }, nil
+}
+```
+
+### 校验最佳实践
+
+```go
+// ============ 1. 分层验证 ============
+/*
+┌─────────────────────────────────────────┐
+│           HTTP/RPC 层                    │
+│  - 格式验证（JSON/Thrift 解析）         │
+│  - 类型验证（字段类型匹配）             │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│           参数验证层                     │
+│  - 必填验证                             │
+│  - 格式验证（邮箱、手机号）             │
+│  - 范围验证（长度、数值范围）           │
+│  - 枚举验证                             │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│           业务验证层                     │
+│  - 唯一性验证                           │
+│  - 关联性验证                           │
+│  - 权限验证                             │
+│  - 状态机验证                           │
+└─────────────────────────────────────────┘
+*/
+
+// ============ 2. 验证错误码定义 ============
+const (
+    ErrCodeValidation      = 40001 // 参数验证失败
+    ErrCodeMissingField    = 40002 // 缺少必填字段
+    ErrCodeInvalidFormat   = 40003 // 格式错误
+    ErrCodeOutOfRange      = 40004 // 超出范围
+    ErrCodeDuplicate       = 40005 // 重复值
+    ErrCodeNotFound        = 40006 // 关联资源不存在
+    ErrCodePermissionDenied = 40007 // 权限不足
+)
+
+// ============ 3. 验证消息国际化 ============
+type ValidationMessages struct {
+    Required     string
+    MinLength    string
+    MaxLength    string
+    Email        string
+    Phone        string
+    Range        string
+}
+
+var messages = map[string]ValidationMessages{
+    "zh": {
+        Required:  "不能为空",
+        MinLength: "长度至少 %d 个字符",
+        MaxLength: "长度最多 %d 个字符",
+        Email:     "邮箱格式错误",
+        Phone:     "手机号格式错误",
+        Range:     "必须在 %d 到 %d 之间",
+    },
+    "en": {
+        Required:  "is required",
+        MinLength: "must be at least %d characters",
+        MaxLength: "must be at most %d characters",
+        Email:     "must be a valid email",
+        Phone:     "must be a valid phone number",
+        Range:     "must be between %d and %d",
+    },
+}
+
+// ============ 4. 安全验证 ============
+type SecureInput struct {
+    // XSS 防护：限制特殊字符
+    Content string `json:"content" vd:"regexp('^[^<>]*$'); msg:'内容包含非法字符'"`
+    
+    // SQL 注入防护：使用参数化查询（在数据库层处理）
+    
+    // 路径穿越防护
+    Filename string `json:"filename" vd:"regexp('^[a-zA-Z0-9_.-]+$'); msg:'文件名只能包含字母数字和._-'"`
+}
+
+// ============ 5. 性能优化 ============
+/*
+1. 使用编译时验证而非运行时反射
+2. 缓存验证器实例
+3. 批量验证时使用并行处理
+4. 简单验证优先，复杂验证（如数据库查询）后置
+*/
+
+// 缓存验证器
+var validatorInstance = validator.New()
+
+func GetValidator() *validator.Validate {
+    return validatorInstance
 }
 ```
 
