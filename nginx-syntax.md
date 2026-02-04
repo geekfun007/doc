@@ -14,6 +14,7 @@
 8. [location 匹配规则](#location-匹配规则)
 9. [正则表达式](#正则表达式)
 10. [常用配置模式](#常用配置模式)
+11. [图片处理与水印](#图片处理与水印)
 
 ---
 
@@ -2197,6 +2198,736 @@ server {
         add_header X-Cache-Status $upstream_cache_status;
     }
 }
+```
+
+---
+
+## 图片处理与水印
+
+Nginx 可以通过内置模块和第三方模块实现图片处理、水印添加、缩略图生成等功能。
+
+### ngx_http_image_filter_module
+
+Nginx 内置的图片处理模块，支持裁剪、缩放、旋转等基本操作。
+
+```bash
+# 检查是否已编译该模块
+nginx -V 2>&1 | grep -o 'http_image_filter_module'
+
+# 如果没有，需要重新编译 Nginx
+./configure --with-http_image_filter_module
+make && make install
+
+# 或使用包管理器安装完整版
+# Ubuntu/Debian
+apt install nginx-extras
+
+# CentOS/RHEL
+yum install nginx-mod-http-image-filter
+```
+
+#### 基本图片处理
+
+```nginx
+http {
+    server {
+        listen 80;
+        server_name images.example.com;
+        
+        # ============ 图片缩放 ============
+        location /resize/ {
+            # 将图片缩放到指定尺寸
+            # image_filter resize width height;
+            image_filter resize 300 200;
+            
+            # 图片质量 (1-100)
+            image_filter_jpeg_quality 85;
+            image_filter_webp_quality 80;
+            
+            # 处理缓冲区大小
+            image_filter_buffer 10M;
+            
+            # 代理到原始图片
+            alias /var/www/images/;
+        }
+        
+        # ============ 等比例缩放 ============
+        location /scale/ {
+            # 按比例缩放，保持宽高比
+            # 只指定宽度，高度自动计算
+            image_filter resize 400 -;
+            
+            # 只指定高度，宽度自动计算
+            # image_filter resize - 300;
+            
+            alias /var/www/images/;
+        }
+        
+        # ============ 裁剪图片 ============
+        location /crop/ {
+            # 裁剪到指定尺寸（从中心裁剪）
+            image_filter crop 200 200;
+            image_filter_jpeg_quality 90;
+            
+            alias /var/www/images/;
+        }
+        
+        # ============ 旋转图片 ============
+        location /rotate/ {
+            # 旋转角度：90, 180, 270
+            image_filter rotate 90;
+            
+            alias /var/www/images/;
+        }
+        
+        # ============ 获取图片尺寸 ============
+        location /size/ {
+            # 返回 JSON 格式的图片信息
+            image_filter size;
+            
+            alias /var/www/images/;
+        }
+        # 返回示例: {"img":{"width":1920,"height":1080,"type":"jpeg"}}
+    }
+}
+```
+
+#### 动态参数处理
+
+```nginx
+server {
+    listen 80;
+    server_name images.example.com;
+    
+    # ============ URL 参数动态处理 ============
+    # 格式: /image/filename.jpg?w=300&h=200&q=85
+    location ~ ^/image/(.+)$ {
+        set $file $1;
+        set $width $arg_w;
+        set $height $arg_h;
+        set $quality $arg_q;
+        
+        # 设置默认值
+        if ($width = "") {
+            set $width "-";
+        }
+        if ($height = "") {
+            set $height "-";
+        }
+        if ($quality = "") {
+            set $quality "85";
+        }
+        
+        # 内部重定向到处理位置
+        rewrite ^ /internal/process last;
+    }
+    
+    location /internal/process {
+        internal;
+        
+        image_filter resize $width $height;
+        image_filter_jpeg_quality $quality;
+        image_filter_buffer 20M;
+        
+        alias /var/www/images/$file;
+    }
+    
+    # ============ 路径参数处理 ============
+    # 格式: /thumb/300x200/filename.jpg
+    location ~ ^/thumb/(\d+)x(\d+)/(.+)$ {
+        set $w $1;
+        set $h $2;
+        set $img $3;
+        
+        image_filter resize $w $h;
+        image_filter_jpeg_quality 80;
+        
+        alias /var/www/images/$img;
+    }
+    
+    # 格式: /thumb/300w/filename.jpg (只指定宽度)
+    location ~ ^/thumb/(\d+)w/(.+)$ {
+        set $w $1;
+        set $img $2;
+        
+        image_filter resize $w -;
+        alias /var/www/images/$img;
+    }
+}
+```
+
+### 使用 Lua 添加水印 (OpenResty)
+
+OpenResty 集成了 LuaJIT，可以实现更复杂的图片处理功能。
+
+```bash
+# 安装 OpenResty
+# Ubuntu
+apt install openresty
+
+# CentOS
+yum install openresty
+
+# 安装 lua-resty-imagick (基于 ImageMagick)
+opm get toruneko/lua-resty-imagick
+```
+
+#### 文字水印
+
+```nginx
+http {
+    lua_package_path "/usr/local/openresty/lualib/?.lua;;";
+    
+    server {
+        listen 80;
+        server_name images.example.com;
+        
+        # ============ 文字水印 ============
+        location ~ ^/watermark/text/(.+)$ {
+            set $image_path /var/www/images/$1;
+            
+            content_by_lua_block {
+                local magick = require("imagick")
+                local img = magick.open(ngx.var.image_path)
+                
+                if not img then
+                    ngx.status = 404
+                    ngx.say("Image not found")
+                    return
+                end
+                
+                -- 获取图片尺寸
+                local width, height = img:get_width(), img:get_height()
+                
+                -- 创建水印文字
+                local text = ngx.var.arg_text or "© Example.com"
+                local font_size = tonumber(ngx.var.arg_size) or 24
+                local opacity = tonumber(ngx.var.arg_opacity) or 0.5
+                
+                -- 添加文字水印
+                img:set_font("Arial")
+                img:set_font_size(font_size)
+                img:set_gravity("SouthEast")  -- 右下角
+                img:annotate(text, 10, 10, 0, opacity)
+                
+                -- 输出图片
+                ngx.header["Content-Type"] = "image/jpeg"
+                ngx.print(img:get_blob())
+                
+                img:destroy()
+            }
+        }
+        
+        # ============ 带背景的文字水印 ============
+        location ~ ^/watermark/label/(.+)$ {
+            set $image_path /var/www/images/$1;
+            
+            content_by_lua_block {
+                local magick = require("imagick")
+                local img = magick.open(ngx.var.image_path)
+                
+                if not img then
+                    ngx.status = 404
+                    return
+                end
+                
+                local width, height = img:get_width(), img:get_height()
+                local text = ngx.var.arg_text or "SAMPLE"
+                
+                -- 创建带背景的标签
+                local label_width = #text * 12 + 20
+                local label_height = 30
+                
+                -- 绘制半透明背景
+                img:set_fill_color("rgba(0,0,0,0.6)")
+                img:rectangle(
+                    width - label_width - 10,
+                    height - label_height - 10,
+                    width - 10,
+                    height - 10
+                )
+                
+                -- 绘制文字
+                img:set_fill_color("white")
+                img:set_font_size(16)
+                img:set_gravity("SouthEast")
+                img:annotate(text, 15, 15)
+                
+                ngx.header["Content-Type"] = "image/jpeg"
+                ngx.print(img:get_blob())
+                img:destroy()
+            }
+        }
+    }
+}
+```
+
+#### 图片水印
+
+```nginx
+server {
+    listen 80;
+    server_name images.example.com;
+    
+    # ============ 图片水印 ============
+    location ~ ^/watermark/image/(.+)$ {
+        set $image_path /var/www/images/$1;
+        set $watermark_path /var/www/watermarks/logo.png;
+        
+        content_by_lua_block {
+            local magick = require("imagick")
+            
+            -- 打开原图
+            local img = magick.open(ngx.var.image_path)
+            if not img then
+                ngx.status = 404
+                ngx.say("Image not found")
+                return
+            end
+            
+            -- 打开水印图片
+            local watermark = magick.open(ngx.var.watermark_path)
+            if not watermark then
+                ngx.header["Content-Type"] = "image/jpeg"
+                ngx.print(img:get_blob())
+                img:destroy()
+                return
+            end
+            
+            -- 获取尺寸
+            local img_w, img_h = img:get_width(), img:get_height()
+            local wm_w, wm_h = watermark:get_width(), watermark:get_height()
+            
+            -- 根据参数确定位置
+            local position = ngx.var.arg_pos or "southeast"
+            local margin = tonumber(ngx.var.arg_margin) or 10
+            local opacity = tonumber(ngx.var.arg_opacity) or 0.8
+            
+            -- 计算水印位置
+            local x, y = 0, 0
+            if position == "southeast" or position == "se" then
+                x = img_w - wm_w - margin
+                y = img_h - wm_h - margin
+            elseif position == "southwest" or position == "sw" then
+                x = margin
+                y = img_h - wm_h - margin
+            elseif position == "northeast" or position == "ne" then
+                x = img_w - wm_w - margin
+                y = margin
+            elseif position == "northwest" or position == "nw" then
+                x = margin
+                y = margin
+            elseif position == "center" then
+                x = (img_w - wm_w) / 2
+                y = (img_h - wm_h) / 2
+            end
+            
+            -- 设置水印透明度
+            watermark:set_opacity(opacity)
+            
+            -- 合成图片
+            img:composite(watermark, x, y, "Over")
+            
+            -- 输出
+            ngx.header["Content-Type"] = "image/jpeg"
+            ngx.print(img:get_blob())
+            
+            img:destroy()
+            watermark:destroy()
+        }
+    }
+    
+    # ============ 平铺水印 ============
+    location ~ ^/watermark/tile/(.+)$ {
+        set $image_path /var/www/images/$1;
+        set $watermark_path /var/www/watermarks/tile-logo.png;
+        
+        content_by_lua_block {
+            local magick = require("imagick")
+            
+            local img = magick.open(ngx.var.image_path)
+            local watermark = magick.open(ngx.var.watermark_path)
+            
+            if not img or not watermark then
+                ngx.status = 404
+                return
+            end
+            
+            local img_w, img_h = img:get_width(), img:get_height()
+            local wm_w, wm_h = watermark:get_width(), watermark:get_height()
+            
+            -- 设置水印透明度
+            watermark:set_opacity(0.3)
+            
+            -- 平铺水印
+            local spacing = 50  -- 水印间距
+            for x = 0, img_w, wm_w + spacing do
+                for y = 0, img_h, wm_h + spacing do
+                    img:composite(watermark, x, y, "Over")
+                end
+            end
+            
+            ngx.header["Content-Type"] = "image/jpeg"
+            ngx.print(img:get_blob())
+            
+            img:destroy()
+            watermark:destroy()
+        }
+    }
+}
+```
+
+### 使用外部程序处理 (ImageMagick)
+
+通过 Nginx 调用 ImageMagick 命令行工具处理图片。
+
+```nginx
+server {
+    listen 80;
+    server_name images.example.com;
+    
+    # ============ 使用 proxy_pass 调用处理服务 ============
+    location ~ ^/process/(.+)$ {
+        # 转发到图片处理服务
+        proxy_pass http://127.0.0.1:8080/process/$1$is_args$args;
+        proxy_cache image_cache;
+        proxy_cache_valid 200 7d;
+    }
+}
+
+# 图片处理服务 (可以是 Python/Node.js/Go 等)
+# 示例 Python Flask 服务:
+```
+
+```python
+# image_processor.py
+from flask import Flask, send_file, request
+from PIL import Image, ImageDraw, ImageFont
+import io
+import os
+
+app = Flask(__name__)
+IMAGE_DIR = "/var/www/images"
+WATERMARK_PATH = "/var/www/watermarks/logo.png"
+
+@app.route("/process/<path:filename>")
+def process_image(filename):
+    filepath = os.path.join(IMAGE_DIR, filename)
+    if not os.path.exists(filepath):
+        return "Not found", 404
+    
+    # 打开图片
+    img = Image.open(filepath)
+    
+    # 获取参数
+    width = request.args.get("w", type=int)
+    height = request.args.get("h", type=int)
+    watermark = request.args.get("watermark", "")
+    text = request.args.get("text", "")
+    
+    # 缩放
+    if width or height:
+        if width and height:
+            img = img.resize((width, height), Image.LANCZOS)
+        elif width:
+            ratio = width / img.width
+            img = img.resize((width, int(img.height * ratio)), Image.LANCZOS)
+        elif height:
+            ratio = height / img.height
+            img = img.resize((int(img.width * ratio), height), Image.LANCZOS)
+    
+    # 图片水印
+    if watermark and os.path.exists(WATERMARK_PATH):
+        wm = Image.open(WATERMARK_PATH).convert("RGBA")
+        # 调整水印透明度
+        wm.putalpha(int(255 * 0.5))
+        # 计算位置（右下角）
+        pos = (img.width - wm.width - 10, img.height - wm.height - 10)
+        img.paste(wm, pos, wm)
+    
+    # 文字水印
+    if text:
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        # 计算文字位置
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        pos = (img.width - text_width - 10, img.height - text_height - 10)
+        # 绘制阴影
+        draw.text((pos[0]+1, pos[1]+1), text, font=font, fill=(0, 0, 0, 128))
+        # 绘制文字
+        draw.text(pos, text, font=font, fill=(255, 255, 255, 200))
+    
+    # 输出
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=85)
+    output.seek(0)
+    
+    return send_file(output, mimetype="image/jpeg")
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8080)
+```
+
+### 缓存配置
+
+图片处理是 CPU 密集型操作，必须配置缓存。
+
+```nginx
+http {
+    # ============ 代理缓存配置 ============
+    proxy_cache_path /var/cache/nginx/images
+        levels=1:2
+        keys_zone=image_cache:100m
+        max_size=10g
+        inactive=7d
+        use_temp_path=off;
+    
+    server {
+        listen 80;
+        server_name images.example.com;
+        
+        # 缓存处理后的图片
+        location ~ ^/thumb/ {
+            # 启用缓存
+            proxy_cache image_cache;
+            proxy_cache_key "$uri$is_args$args";
+            proxy_cache_valid 200 7d;
+            proxy_cache_valid 404 1m;
+            
+            # 添加缓存状态头
+            add_header X-Cache-Status $upstream_cache_status;
+            
+            # 处理图片
+            image_filter resize 300 200;
+            image_filter_buffer 10M;
+            
+            alias /var/www/images/;
+        }
+        
+        # ============ 浏览器缓存 ============
+        location ~* \.(jpg|jpeg|png|gif|webp)$ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+            add_header Vary "Accept";
+            
+            root /var/www/images;
+        }
+    }
+}
+```
+
+### 完整配置示例
+
+```nginx
+# /etc/nginx/conf.d/image-server.conf
+
+# 缓存配置
+proxy_cache_path /var/cache/nginx/images
+    levels=1:2
+    keys_zone=img_cache:100m
+    max_size=20g
+    inactive=30d
+    use_temp_path=off;
+
+# 限流配置
+limit_req_zone $binary_remote_addr zone=img_limit:10m rate=10r/s;
+
+server {
+    listen 80;
+    server_name images.example.com;
+    
+    root /var/www/images;
+    
+    # 访问日志
+    access_log /var/log/nginx/images.access.log;
+    error_log /var/log/nginx/images.error.log;
+    
+    # 客户端限制
+    client_max_body_size 50M;
+    
+    # ============ 原图访问 ============
+    location /original/ {
+        alias /var/www/images/;
+        
+        # 防盗链
+        valid_referers none blocked server_names *.example.com;
+        if ($invalid_referer) {
+            return 403;
+        }
+        
+        # 浏览器缓存
+        expires 30d;
+        add_header Cache-Control "public";
+    }
+    
+    # ============ 缩略图服务 ============
+    # /thumb/300x200/path/to/image.jpg
+    location ~ ^/thumb/(\d+)x(\d+)/(.+)$ {
+        set $w $1;
+        set $h $2;
+        set $img $3;
+        
+        # 限流
+        limit_req zone=img_limit burst=20 nodelay;
+        
+        # 缓存
+        proxy_cache img_cache;
+        proxy_cache_key "thumb_${w}x${h}_$img";
+        proxy_cache_valid 200 30d;
+        add_header X-Cache $upstream_cache_status;
+        
+        # 限制最大尺寸
+        if ($w > 2000) {
+            return 400;
+        }
+        if ($h > 2000) {
+            return 400;
+        }
+        
+        # 图片处理
+        image_filter resize $w $h;
+        image_filter_jpeg_quality 85;
+        image_filter_buffer 20M;
+        image_filter_interlace on;
+        
+        # 错误处理
+        error_page 415 = /error/unsupported.jpg;
+        
+        alias /var/www/images/$img;
+    }
+    
+    # ============ 裁剪服务 ============
+    # /crop/200x200/path/to/image.jpg
+    location ~ ^/crop/(\d+)x(\d+)/(.+)$ {
+        set $w $1;
+        set $h $2;
+        set $img $3;
+        
+        proxy_cache img_cache;
+        proxy_cache_key "crop_${w}x${h}_$img";
+        proxy_cache_valid 200 30d;
+        
+        image_filter crop $w $h;
+        image_filter_jpeg_quality 90;
+        image_filter_buffer 20M;
+        
+        alias /var/www/images/$img;
+    }
+    
+    # ============ 动态水印 ============
+    # /watermark/path/to/image.jpg?text=Copyright
+    location ~ ^/watermark/(.+)$ {
+        set $img $1;
+        
+        # 限流（水印处理更耗资源）
+        limit_req zone=img_limit burst=5 nodelay;
+        
+        proxy_cache img_cache;
+        proxy_cache_key "wm_$img_$arg_text";
+        proxy_cache_valid 200 7d;
+        
+        # 转发到 Lua 处理或外部服务
+        proxy_pass http://127.0.0.1:8080/watermark/$img$is_args$args;
+    }
+    
+    # ============ WebP 自动转换 ============
+    location ~ ^/webp/(.+)\.(jpg|jpeg|png)$ {
+        set $img $1.$2;
+        
+        # 检查浏览器是否支持 WebP
+        if ($http_accept ~* "webp") {
+            # 尝试返回 WebP 版本
+            rewrite ^ /webp-internal/$img last;
+        }
+        
+        # 返回原图
+        alias /var/www/images/$img;
+    }
+    
+    location /webp-internal/ {
+        internal;
+        
+        # 检查 WebP 文件是否存在
+        try_files /webp/$uri.webp /original/$uri =404;
+        
+        add_header Vary Accept;
+        expires 30d;
+    }
+    
+    # ============ 错误页面 ============
+    location /error/ {
+        internal;
+        alias /var/www/images/errors/;
+    }
+    
+    # ============ 健康检查 ============
+    location /health {
+        return 200 "OK";
+        add_header Content-Type text/plain;
+    }
+}
+```
+
+### 性能优化建议
+
+```nginx
+# 1. 启用 sendfile
+sendfile on;
+tcp_nopush on;
+tcp_nodelay on;
+
+# 2. 调整缓冲区
+image_filter_buffer 20M;          # 图片处理缓冲区
+client_body_buffer_size 10M;       # 客户端请求体缓冲区
+
+# 3. 限制处理尺寸
+# 在应用层限制最大处理尺寸，防止资源耗尽
+if ($w > 2000) { return 400; }
+
+# 4. 使用缓存
+proxy_cache_path ... max_size=20g inactive=30d;
+
+# 5. 限流保护
+limit_req_zone $binary_remote_addr zone=img_limit:10m rate=10r/s;
+
+# 6. 预生成缩略图
+# 对于热门图片，可以预先生成缩略图存储
+
+# 7. CDN 加速
+# 将处理后的图片推送到 CDN
+
+# 8. 异步处理
+# 对于复杂处理，使用消息队列异步处理
+```
+
+### 常用图片处理 URL 格式
+
+```
+# 缩放
+/thumb/300x200/image.jpg          # 指定宽高
+/thumb/300w/image.jpg             # 只指定宽度
+/thumb/h200/image.jpg             # 只指定高度
+
+# 裁剪
+/crop/200x200/image.jpg           # 中心裁剪
+/crop/200x200/nw/image.jpg        # 左上角裁剪
+
+# 水印
+/watermark/image.jpg?text=©2024   # 文字水印
+/watermark/image.jpg?logo=1       # 图片水印
+/watermark/image.jpg?pos=se       # 指定位置
+
+# 质量
+/thumb/300x200/image.jpg?q=85     # 指定质量
+
+# 格式转换
+/convert/webp/image.jpg           # 转换为 WebP
+/convert/png/image.jpg            # 转换为 PNG
+
+# 组合操作
+/thumb/300x200/image.jpg?watermark=1&q=90
 ```
 
 ---
