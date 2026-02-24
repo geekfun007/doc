@@ -1,4 +1,4 @@
-.PHONY: all build-api build-user build-article clean gen docker-up docker-down
+.PHONY: all build-api build-user build-article clean gen gen-kitex gen-hz docker-up docker-down
 
 all: build-api build-user build-article
 
@@ -11,10 +11,15 @@ build-user:
 build-article:
 	cd service/article && go build -o ../../output/article-server .
 
-gen:
+gen: gen-kitex gen-hz
+
+gen-kitex:
 	cd kitex_gen && kitex -module byte.dance/kitex_gen -gen-path . ../idl/user.thrift
 	cd kitex_gen && kitex -module byte.dance/kitex_gen -gen-path . ../idl/article.thrift
 	cd kitex_gen && go mod tidy
+
+gen-hz:
+	cd api && hz update -idl ../idl/api.thrift
 
 clean:
 	rm -rf output/
