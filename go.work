@@ -1,0 +1,9 @@
+go 1.22.2
+
+use (
+	./kitex_gen
+	./pkg
+	./api
+	./service/user
+	./service/article
+)

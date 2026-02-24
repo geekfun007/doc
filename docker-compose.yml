@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  etcd:
+    image: bitnami/etcd:3.5
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+    ports:
+      - "2379:2379"
+    networks:
+      - byte-net
+
+  user:
+    build:
+      context: .
+      dockerfile: service/user/Dockerfile
+    depends_on:
+      - etcd
+    environment:
+      - ETCD_ENDPOINT=etcd:2379
+    restart: on-failure
+    networks:
+      - byte-net
+
+  article:
+    build:
+      context: .
+      dockerfile: service/article/Dockerfile
+    depends_on:
+      - etcd
+    environment:
+      - ETCD_ENDPOINT=etcd:2379
+    restart: on-failure
+    networks:
+      - byte-net
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    depends_on:
+      - etcd
+      - user
+      - article
+    environment:
+      - ETCD_ENDPOINT=etcd:2379
+    ports:
+      - "8080:8080"
+    restart: on-failure
+    networks:
+      - byte-net
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+    restart: on-failure
+    networks:
+      - byte-net
+
+networks:
+  byte-net:
+    driver: bridge
